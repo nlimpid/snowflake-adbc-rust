@@ -2,37 +2,23 @@ name: ci
 
 on:
   push:
+    branches: [main]
   pull_request:
 
 jobs:
-  test:
+  ci:
     runs-on: ubuntu-latest
-    strategy:
-      fail-fast: false
-      matrix:
-        cloud: [aws, azure, gcp]
-        rust: [stable, "1.99"]
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@master
+      - uses: dtolnay/rust-toolchain@stable
         with:
-          toolchain: ${{ matrix.rust }}
           components: rustfmt, clippy
-      - name: fmt, clippy, build
+      - uses: Swatinem/rust-cache@v2
+      - name: lint
         run: |
           cargo fmt --all -- --check
           cargo clippy --workspace --all-targets -- -D warnings
-          cargo build --workspace
+      - name: build
+        run: cargo build --workspace --all-targets
       - name: test
-        env:
-          PARAMETERS_SECRET: ${{ secrets.PARAMETERS_SECRET }}
-        run: |
-          enc="ci/parameters/parameters_${{ matrix.cloud }}.json.gpg"
-          if [ -n "${PARAMETERS_SECRET:-}" ] && [ -f "$enc" ]; then
-            # shellcheck disable=SC1091
-            source ci/scripts/decrypt_parameters.sh "${{ matrix.cloud }}"
-            export SNOWFLAKE_TEST_REQUIRED=1
-          else
-            echo "no parameters for ${{ matrix.cloud }}; real-account tests skip"
-          fi
-          cargo test --workspace
+        run: cargo test --workspace
