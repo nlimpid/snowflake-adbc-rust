@@ -15,7 +15,7 @@ pub use schema::{
 };
 pub use stream::{record_batches, record_batches_with, BlockingBatchReader};
 
-pub const ARROW_RS_VERSION: &str = "59";
+pub const ARROW_RS_VERSION: &str = "59.3.1";
 
 use arrow_array::RecordBatch;
 

@@ -21,7 +21,7 @@ cargo test --workspace
 cargo build -p snowflake-adbc-ffi
 ```
 
-Rust 1.89 or newer. `adbc_core` itself allows 1.85, but current `uuid` and `idna` releases need 1.89. Real-account tests skip unless `SNOWFLAKE_TEST_ACCOUNT`, `SNOWFLAKE_TEST_USER`, `SNOWFLAKE_TEST_PASSWORD` (or a private key), `SNOWFLAKE_TEST_WAREHOUSE`, `SNOWFLAKE_TEST_DATABASE`, `SNOWFLAKE_TEST_SCHEMA`, and `SNOWFLAKE_TEST_ROLE` are set. CI decrypts `ci/parameters/parameters_<cloud>.json.gpg` with `PARAMETERS_SECRET` and sets `SNOWFLAKE_TEST_REQUIRED=1`. See [`ci/parameters/README.md`](ci/parameters/README.md).
+Rust 1.99 or newer, matching castor-agent. Arrow is 59.3.1 and reqwest is 0.13.5. Real-account tests skip unless `SNOWFLAKE_TEST_ACCOUNT`, `SNOWFLAKE_TEST_USER`, `SNOWFLAKE_TEST_PASSWORD` (or a private key), `SNOWFLAKE_TEST_WAREHOUSE`, `SNOWFLAKE_TEST_DATABASE`, `SNOWFLAKE_TEST_SCHEMA`, and `SNOWFLAKE_TEST_ROLE` are set. CI decrypts `ci/parameters/parameters_<cloud>.json.gpg` with `PARAMETERS_SECRET` and sets `SNOWFLAKE_TEST_REQUIRED=1`. See [`ci/parameters/README.md`](ci/parameters/README.md).
 
 Password login needs a `LEGACY_SERVICE` user. Key-pair JWT is `Authenticator::key_pair_from_pem`.
 

@@ -61,7 +61,7 @@ snowflake-rs/                      # Cargo workspace
 
 | 用途 | crate | 说明 |
 | --- | --- | --- |
-| HTTP | `reqwest`（features: `rustls-tls`, `json`, `gzip`, `stream`） | **版本与 castor 在 workspace 中统一**。`gzip` 用于分片下载的 `Content-Encoding: gzip` 透明解压 |
+| HTTP | `reqwest` 0.13.5（features: `json`, `rustls`, `gzip`, `stream`） | 版本和 feature 与 castor-agent 对齐；`gzip`、`stream` 是分片下载额外需要的 |
 | 异步运行时 | `tokio` | 核心 API 是 async；ADBC 层内部持有/借用 runtime 做同步桥接 |
 | 序列化 | `serde`, `serde_json` | 协议请求/响应 |
 | Arrow | `arrow-array`, `arrow-schema`, `arrow-ipc`, `arrow-buffer` | **版本与 `adbc_core` 依赖的 arrow 大版本对齐**（arrow-rs 每月出大版本，必须锁定） |
