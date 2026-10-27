@@ -13,7 +13,7 @@ snowflake-arrow = "0.1"
 snowflake-adbc = "0.1"
 ```
 
-The `publish` workflow uploads `0.1.0` when a GitHub Release is published, or when the workflow is started by hand. The repository needs a `CARGO_REGISTRY_TOKEN` secret from crates.io.
+The `publish` workflow uploads the workspace version when a GitHub Release is published, or when the workflow is started by hand. A version that is already on crates.io is skipped. The repository secret `CARGO_REGISTRY_TOKEN` is the crates.io API token.
 
 ## Crates
 
