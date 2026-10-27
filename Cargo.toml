@@ -14,7 +14,10 @@ edition = "2021"
 license = "Apache-2.0"
 rust-version = "1.99"
 authors = ["snowflake-adbc-rust contributors"]
-repository = "https://cursor.com/codebase/nlimpid/snowflake-adbc-rust"
+repository = "https://github.com/nlimpid/snowflake-adbc-rust"
+homepage = "https://github.com/nlimpid/snowflake-adbc-rust"
+keywords = ["snowflake", "arrow", "adbc", "database"]
+categories = ["database", "api-bindings"]
 
 [workspace.dependencies]
 adbc_core = "0.24"
@@ -34,10 +37,10 @@ rsa = { version = "0.9", features = ["sha2", "pem"] }
 serde = { version = "=1.0.229", features = ["derive"] }
 serde_json = "=1.0.154"
 sha2 = "0.10"
-snowflake-adbc = { path = "crates/snowflake-adbc" }
-snowflake-arrow = { path = "crates/snowflake-arrow" }
-snowflake-core = { path = "crates/snowflake-core" }
-snowflake-testing = { path = "crates/snowflake-testing" }
+snowflake-adbc = { version = "0.1.0", path = "crates/snowflake-adbc" }
+snowflake-arrow = { version = "0.1.0", path = "crates/snowflake-arrow" }
+snowflake-core = { version = "0.1.0", path = "crates/snowflake-core" }
+snowflake-testing = { version = "0.1.0", path = "crates/snowflake-testing" }
 thiserror = "2"
 tokio = { version = "=1.54.1", features = ["macros", "rt-multi-thread", "sync", "time"] }
 tracing = "=0.1.44"

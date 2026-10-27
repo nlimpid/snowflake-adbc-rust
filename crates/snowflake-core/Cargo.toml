@@ -6,6 +6,11 @@ license.workspace = true
 rust-version.workspace = true
 description = "Snowflake SQL API client: login, query, chunk download. No Arrow dependency."
 authors.workspace = true
+repository.workspace = true
+homepage.workspace = true
+keywords.workspace = true
+categories.workspace = true
+readme = "../../README.md"
 
 [dependencies]
 base64.workspace = true
@@ -25,6 +30,4 @@ uuid.workspace = true
 
 [dev-dependencies]
 rand = "0.8"
-snowflake-arrow.workspace = true
-snowflake-testing.workspace = true
 tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }

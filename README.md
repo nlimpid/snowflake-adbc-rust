@@ -4,6 +4,17 @@ A Snowflake driver written in Rust. It speaks the same REST SQL API as the offic
 
 The design is in [`docs/snowflake-rust-driver-design.md`](docs/snowflake-rust-driver-design.md).
 
+## Crates.io
+
+```toml
+[dependencies]
+snowflake-core = "0.1"
+snowflake-arrow = "0.1"
+snowflake-adbc = "0.1"
+```
+
+The `publish` workflow uploads `0.1.0` when a GitHub Release is published, or when the workflow is started by hand. The repository needs a `CARGO_REGISTRY_TOKEN` secret from crates.io.
+
 ## Crates
 
 | Crate | Role |

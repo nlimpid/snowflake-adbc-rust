@@ -159,23 +159,4 @@ mod tests {
         );
         assert_eq!(normalized[0], from_json);
     }
-
-    #[tokio::test]
-    async fn live_both_formats_agree_on_number() {
-        let Some(session) = snowflake_testing::test_session().await else {
-            return;
-        };
-        let (arrow, json) = snowflake_testing::exec_both_formats(
-            &session,
-            "select 123.456::number(10,3) as v, null::number(10,3)",
-        )
-        .await
-        .unwrap();
-        assert_eq!(arrow, json);
-        assert_eq!(
-            arrow[0].schema().field(0).data_type(),
-            &DataType::Decimal128(10, 3)
-        );
-        session.close().await.unwrap();
-    }
 }

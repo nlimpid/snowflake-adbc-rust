@@ -6,6 +6,11 @@ license.workspace = true
 rust-version.workspace = true
 description = "ADBC driver for Snowflake, implemented on snowflake-core."
 authors.workspace = true
+repository.workspace = true
+homepage.workspace = true
+keywords.workspace = true
+categories.workspace = true
+readme = "../../README.md"
 
 [features]
 default = []
@@ -22,7 +27,3 @@ snowflake-arrow.workspace = true
 snowflake-core.workspace = true
 tokio.workspace = true
 url.workspace = true
-
-[dev-dependencies]
-adbc_driver_manager.workspace = true
-snowflake-testing.workspace = true

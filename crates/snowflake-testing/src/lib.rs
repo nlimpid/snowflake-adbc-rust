@@ -174,3 +174,6 @@ async fn run_with_format(
 pub fn quote_ident(name: &str) -> String {
     format!("\"{}\"", name.replace('"', "\"\""))
 }
+
+#[cfg(test)]
+mod live;
