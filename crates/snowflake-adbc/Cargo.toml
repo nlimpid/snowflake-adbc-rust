@@ -1,0 +1,28 @@
+[package]
+name = "snowflake-adbc"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "ADBC driver for Snowflake, implemented on snowflake-core."
+authors.workspace = true
+
+[features]
+default = []
+# The C ABI lives in the snowflake-adbc-ffi crate, which depends on this one.
+ffi = []
+
+[dependencies]
+adbc_core.workspace = true
+arrow-array.workspace = true
+arrow-buffer.workspace = true
+arrow-schema.workspace = true
+futures.workspace = true
+snowflake-arrow.workspace = true
+snowflake-core.workspace = true
+tokio.workspace = true
+url.workspace = true
+
+[dev-dependencies]
+adbc_driver_manager.workspace = true
+snowflake-testing.workspace = true

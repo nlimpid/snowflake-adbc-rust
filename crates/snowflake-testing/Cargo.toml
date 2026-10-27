@@ -1,0 +1,16 @@
+[package]
+name = "snowflake-testing"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "Helpers for real-account Snowflake driver tests."
+authors.workspace = true
+
+[dependencies]
+arrow-array.workspace = true
+futures.workspace = true
+snowflake-arrow.workspace = true
+snowflake-core.workspace = true
+tokio.workspace = true
+uuid.workspace = true

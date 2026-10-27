@@ -1,0 +1,46 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/snowflake-core",
+    "crates/snowflake-arrow",
+    "crates/snowflake-adbc",
+    "crates/snowflake-adbc-ffi",
+    "crates/snowflake-testing",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "Apache-2.0"
+rust-version = "1.89"
+authors = ["snowflake-adbc-rust contributors"]
+repository = "https://cursor.com/codebase/nlimpid/snowflake-adbc-rust"
+
+[workspace.dependencies]
+adbc_core = "0.24"
+async-stream = "0.3"
+adbc_driver_manager = "0.24"
+adbc_ffi = "0.24"
+arrow-array = "59"
+arrow-buffer = "59"
+arrow-cast = "59"
+arrow-ipc = "59"
+arrow-schema = "59"
+base64 = "0.22"
+bytes = "1"
+futures = "0.3"
+pkcs8 = { version = "0.10", features = ["pem", "std", "encryption"] }
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json", "gzip", "stream"] }
+rsa = { version = "0.9", features = ["sha2", "pem"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha2 = "0.10"
+snowflake-adbc = { path = "crates/snowflake-adbc" }
+snowflake-arrow = { path = "crates/snowflake-arrow" }
+snowflake-core = { path = "crates/snowflake-core" }
+snowflake-testing = { path = "crates/snowflake-testing" }
+thiserror = "2"
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "sync", "time"] }
+tracing = "0.1"
+url = "2"
+uuid = { version = "1", features = ["v4"] }

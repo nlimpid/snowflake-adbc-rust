@@ -1,0 +1,17 @@
+[package]
+name = "snowflake-adbc-ffi"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "C ABI export of the Snowflake ADBC driver."
+authors.workspace = true
+
+[lib]
+name = "adbc_driver_snowflake_rs"
+crate-type = ["cdylib"]
+
+[dependencies]
+adbc_core.workspace = true
+adbc_ffi.workspace = true
+snowflake-adbc.workspace = true

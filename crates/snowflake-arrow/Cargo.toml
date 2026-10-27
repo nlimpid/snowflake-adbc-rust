@@ -1,0 +1,24 @@
+[package]
+name = "snowflake-arrow"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "Strict Snowflake rowtype to Arrow conversion for JSON and Arrow IPC results."
+authors.workspace = true
+
+[dependencies]
+arrow-array.workspace = true
+arrow-buffer.workspace = true
+arrow-ipc.workspace = true
+arrow-schema.workspace = true
+async-stream.workspace = true
+bytes.workspace = true
+futures.workspace = true
+serde_json.workspace = true
+snowflake-core.workspace = true
+tokio.workspace = true
+
+[dev-dependencies]
+snowflake-testing.workspace = true
+tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
