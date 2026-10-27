@@ -6,6 +6,11 @@ license.workspace = true
 rust-version.workspace = true
 description = "C ABI export of the Snowflake ADBC driver."
 authors.workspace = true
+repository.workspace = true
+homepage.workspace = true
+keywords.workspace = true
+categories.workspace = true
+readme = "../../README.md"
 
 [lib]
 name = "adbc_driver_snowflake_rs"

@@ -6,6 +6,7 @@ license.workspace = true
 rust-version.workspace = true
 description = "Helpers for real-account Snowflake driver tests."
 authors.workspace = true
+publish = false
 
 [dependencies]
 arrow-array.workspace = true
@@ -14,3 +15,6 @@ snowflake-arrow.workspace = true
 snowflake-core.workspace = true
 tokio.workspace = true
 uuid.workspace = true
+
+[dev-dependencies]
+arrow-schema.workspace = true
