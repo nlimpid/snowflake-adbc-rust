@@ -43,9 +43,12 @@ snowflake-rs/                      # Cargo workspace
 │   ├── snowflake-core/            # 协议层：HTTP、认证、会话、查询、分片下载、JSON 结果解码（不依赖 arrow）
 │   ├── snowflake-arrow/           # Arrow 层：Arrow IPC 解码 + Snowflake 物理类型 → 标准 Arrow 类型归一化 + JSON rowset → RecordBatch
 │   ├── snowflake-adbc/            # ADBC 层：实现 adbc_core 的 Driver/Database/Connection/Statement
-│   └── snowflake-adbc-ffi/        # cdylib，用 adbc_ffi::export_driver! 导出 C ABI 的 ADBC 驱动（可被任何语言的 driver manager 加载）
-├── tests/                         # 集成测试（需要真实账号，默认 #[ignore]）
-└── fixtures/                      # 录制的协议响应 / Arrow IPC 样本，供单元测试使用
+│   ├── snowflake-adbc-ffi/        # cdylib，用 adbc_ffi::export_driver! 导出 C ABI 的 ADBC 驱动（可被任何语言的 driver manager 加载）
+│   └── snowflake-testing/         # 测试辅助（dev-dependency）：读取 SNOWFLAKE_TEST_* 环境变量、建立真实会话、临时表命名
+├── ci/
+│   ├── parameters/                # parameters_{aws,azure,gcp}.json.gpg，加密的测试账号凭据
+│   └── scripts/                   # 解密参数、导出环境变量、跑测试
+└── (无 fixtures / mock：所有测试与源码同文件，连真实账号，见第 7 节)
 ```
 
 分层原则：
@@ -312,7 +315,7 @@ Arrow IPC bytes ──arrow-ipc StreamReader──▶ Snowflake 物理 RecordBat
 JSON rowset     ──strict parse per rowtype──────────────────────────────────────────▶ 标准 RecordBatch
 ```
 
-两条路径对同一个 `rowtype` 必须产出**完全相同的 Arrow Schema**，这样调用方不需要关心服务端这次返回的是哪种格式。单元测试要用同一份数据分别走两条路径并断言 `RecordBatch` 相等。
+两条路径对同一个 `rowtype` 必须产出**完全相同的 Arrow Schema**，这样调用方不需要关心服务端这次返回的是哪种格式。测试方式是在真实会话里对同一条 SQL 分别以 ARROW 和 JSON 格式执行（`ALTER SESSION SET GO_QUERY_RESULT_FORMAT`），断言两次得到的 `RecordBatch` 相等（见 7.3）。
 
 ### 4.1 逻辑类型 → Arrow 目标类型（严格映射表）
 
@@ -479,14 +482,108 @@ Snowflake 返回的 IPC stream 里，字段 metadata 含 `logicalType`、`scale`
 
 ## 7. 测试策略
 
-| 层 | 方法 |
+照搬 gosnowflake 的做法：**不做 HTTP mock，不录 fixture，所有测试连真实账号**。测试代码与被测代码放在同一个源文件的 `#[cfg(test)] mod tests` 里（对应 Go 的 `*_test.go` 同目录），凭据通过环境变量注入，CI 从仓库内加密的参数文件解密出来。
+
+唯一的例外是不涉及网络的纯函数（JSON 单元格解析、JWT 签名与指纹计算、账号名/host 推导、绑定参数编码）。它们用普通 `#[test]` 直接测，这不是 mock，只是不需要会话。
+
+### 7.1 环境变量与凭据
+
+| 变量 | 必填 | 说明 |
+| --- | --- | --- |
+| `SNOWFLAKE_TEST_ACCOUNT` | 是 | 账号标识 |
+| `SNOWFLAKE_TEST_USER` | 是 | 登录名 |
+| `SNOWFLAKE_TEST_PASSWORD` | 是（M1） | 密码；M2 之后与 `PRIVATE_KEY` 二选一 |
+| `SNOWFLAKE_TEST_PRIVATE_KEY` / `_PRIVATE_KEY_PATH` / `_PRIVATE_KEY_PASSPHRASE` | M2 起 | Key-Pair 认证测试 |
+| `SNOWFLAKE_TEST_WAREHOUSE` | 是 | |
+| `SNOWFLAKE_TEST_DATABASE` | 是 | 测试库，测试只在这里建临时对象 |
+| `SNOWFLAKE_TEST_SCHEMA` | 是 | |
+| `SNOWFLAKE_TEST_ROLE` | 是 | |
+| `SNOWFLAKE_TEST_HOST` | 否 | 覆盖默认 host（PrivateLink / 中国区） |
+| `SNOWFLAKE_TEST_PROTOCOL` / `SNOWFLAKE_TEST_PORT` | 否 | 默认 `https` / `443` |
+| `SNOWFLAKE_TEST_REQUIRED` | 否 | 设为 `1` 时（CI），缺少凭据直接 panic，防止“什么都没跑却绿了”；本地未设置时测试打印提示并跳过 |
+
+凭据文件：`ci/parameters/parameters_{aws,azure,gcp}.json.gpg`，用对称口令加密（`gpg --symmetric --cipher-algo AES256`），口令以 `PARAMETERS_SECRET` 存在 CI secret 中。解密后的 JSON 结构与 gosnowflake 一致：
+
+```json
+{
+  "testconnection": {
+    "SNOWFLAKE_TEST_ACCOUNT": "...",
+    "SNOWFLAKE_TEST_USER": "...",
+    "SNOWFLAKE_TEST_PASSWORD": "...",
+    "SNOWFLAKE_TEST_WAREHOUSE": "...",
+    "SNOWFLAKE_TEST_DATABASE": "...",
+    "SNOWFLAKE_TEST_SCHEMA": "...",
+    "SNOWFLAKE_TEST_ROLE": "..."
+  }
+}
+```
+
+`ci/scripts/decrypt_parameters.sh <cloud>` 解密并把 `testconnection` 下每个键 `export` 成环境变量；`*.json`（明文）加入 `.gitignore`。本地开发者拿到口令后用同一脚本解密，或自己 `export` 这组变量。
+
+### 7.2 测试辅助（`snowflake-testing`）
+
+各 crate 的 dev-dependency，提供：
+
+```rust
+/// 读取 SNOWFLAKE_TEST_*；缺失时按 SNOWFLAKE_TEST_REQUIRED 决定 panic 还是返回 None。
+pub fn test_config() -> Option<TestConfig>;
+
+/// 用 test_config 建立一个真实会话（登录 + USE WAREHOUSE/DATABASE/SCHEMA/ROLE）。
+pub async fn test_session() -> Option<Session>;
+
+/// 生成唯一对象名（前缀 + 随机后缀），测试内只建 TEMPORARY 表，会话关闭即释放。
+pub fn unique_name(prefix: &str) -> String;
+
+/// 在同一会话内用 ARROW 和 JSON 两种格式分别执行 sql，返回两份 RecordBatch。
+pub async fn exec_both_formats(session: &Session, sql: &str) -> (Vec<RecordBatch>, Vec<RecordBatch>);
+```
+
+约定：
+
+- 每个测试自己 `test_session().await`，结束时 `close()`；登录开销在几百毫秒级，可接受。`cargo test` 默认并行，若触发账号并发限制用 `--test-threads` 调低。
+- 不依赖任何预置表。需要数据就 `CREATE TEMPORARY TABLE` + `INSERT`，或用 `VALUES` / `TABLE(GENERATOR(...))` 现场生成。
+- 测试写法与 Go 的 `runDBTest(t, func(dbt *DBTest){...})` 等价：
+
+```rust
+#[tokio::test]
+async fn select_number_scale_3_as_decimal128() {
+    let Some(session) = test_session().await else { return };
+    let (arrow, json) = exec_both_formats(&session, "select 123.456::number(10,3) as v").await;
+    assert_eq!(arrow, json);
+    assert_eq!(arrow[0].schema().field(0).data_type(), &DataType::Decimal128(10, 3));
+    session.close().await.unwrap();
+}
+```
+
+### 7.3 覆盖范围
+
+| 领域 | 真实账号上怎么测 |
 | --- | --- |
-| 协议序列化 | 请求体 / 响应体的 serde 单元测试，固定 fixture 来自真实抓取并脱敏 |
-| HTTP 流程 | `wiremock` 模拟服务端：登录成功/失败、`390112` 续期重放、`333334` 轮询、5xx 重试、分片下载 header 校验 |
-| Arrow 归一化 | 用真实账号录制每种类型的 `rowsetBase64`（覆盖 scale 0/3/6/9、NULL、极值、负数、TZ 不同偏移）存入 `fixtures/`，断言归一化结果；同一数据的 JSON 版本走 JSON 路径，断言两路径 `RecordBatch` 相等 |
-| 严格性 | 构造非法 JSON 单元格（`"abc"` 当 fixed、奇数长 hex、`"maybe"` 当 boolean、超范围 timestamp）断言返回 `Error::Decode` 且带列名/行号/原文，且绝不产出 NULL |
-| 集成 | `tests/` 下 `#[ignore]` 测试，由 `SNOWFLAKE_ACCOUNT / USER / PASSWORD / PRIVATE_KEY_PATH / WAREHOUSE` 环境变量驱动；CI 中有凭据时开启。覆盖：类型矩阵 `SELECT`、`SHOW`（JSON 分支）、> 1 个分片的大结果（`TABLE(GENERATOR(ROWCOUNT => 5_000_000))`）、> 45 秒的查询（`SYSTEM$WAIT(60)`）、取消 |
-| ADBC | `adbc_driver_manager` 加载 cdylib，跑 `get_info` / `get_objects` / `execute` / `execute_update` / `bind` |
+| 认证 | 密码登录成功；错误密码返回 `Error::Auth{code: "390100"}`；（M2）Key-Pair 登录成功、错误私钥返回 `390144` |
+| 会话生命周期 | 登录参数（`TIMEZONE`）被正确读取；`ALTER SESSION SET TIMEZONE` 后下一次查询的 LTZ 列时区随之变化；`close()` 后再查询报错 |
+| 令牌续期 | 用 `ALTER SESSION SET` 无法缩短 token 有效期，改为在测试里把 `Session.tokens` 的 session token 篡改为过期/非法值，发请求触发 `390112` → 续期 → 重放成功 |
+| 类型矩阵 | 对 4.1 表每一种逻辑类型，用 `SELECT ... ::type` 覆盖：NULL、零、负数、极值、`scale` 0/3/6/9、TZ 不同偏移、`FLOAT` 的 `inf/-inf/NaN`、空字符串、空二进制。每条 SQL 都走 `exec_both_formats`，断言 ARROW 与 JSON 结果相等且 Arrow 类型符合映射表 |
+| 严格性 | 服务端不会返回非法值，所以严格性用纯函数测试覆盖：直接调用列解码器喂 `"abc"` 当 fixed、奇数长 hex、`"maybe"` 当 boolean、超范围 timestamp，断言返回 `Error::Decode` 且带列名/行号/原文，绝不产出 NULL |
+| JSON 分支 | `SHOW TABLES`、`DESCRIBE TABLE`、`USE SCHEMA`、DDL：断言 `queryResultFormat == "json"` 时也能产出正确 Schema 的 `RecordBatch` |
+| 分片下载 | `SELECT seq8(), randstr(100, random()) FROM TABLE(GENERATOR(ROWCOUNT => 2_000_000))`：断言 `chunks.len() > 1`、总行数一致、顺序正确（`seq8` 单调）、并发预取下内存有界 |
+| 长查询轮询 | `SELECT SYSTEM$WAIT(60)`：断言经过 `333334` 轮询后成功返回 |
+| 取消 | 启动 `SYSTEM$WAIT(300)`，另一个任务调用 `cancel()`，断言原查询返回 `Error::Cancelled`，且 `QUERY_HISTORY` 中状态为 cancelled |
+| 绑定参数 | 每种绑定类型 `SELECT ?` 回读；数组绑定批量 `INSERT` 到临时表后 `COUNT(*)` |
+| 多云差异 | 同一套测试在 AWS / Azure / GCP 三个账号上各跑一遍（分片存储的预签名 URL 和加密 header 不同） |
+| ADBC | `snowflake-adbc` 的测试通过 `adbc_driver_manager` 加载 `snowflake-adbc-ffi` 产出的 cdylib，用同一组环境变量拼成 `uri`，跑 `get_info` / `get_objects` / `get_table_schema` / `execute` / `execute_update` / `bind`；M3 时额外跑一次 `adbc-drivers/snowflake` 仓库的 validation 套件做对照 |
+
+### 7.4 CI 流程
+
+```
+matrix: cloud ∈ {aws, azure, gcp} × rust ∈ {stable, msrv}
+steps:
+  - cargo fmt --check && cargo clippy --all-targets -D warnings
+  - cargo build --workspace
+  - ci/scripts/decrypt_parameters.sh $cloud        # 需要 PARAMETERS_SECRET
+  - SNOWFLAKE_TEST_REQUIRED=1 cargo test --workspace
+```
+
+来自 fork 的外部 PR 拿不到 secret，只跑 fmt / clippy / build 和纯函数测试；带凭据的全量测试由维护者在主仓库分支上跑。
 
 ---
 
@@ -495,7 +592,7 @@ Snowflake 返回的 IPC stream 里，字段 metadata 含 `logicalType`、`scale`
 | 风险 | 应对 |
 | --- | --- |
 | Arrow 结果格式协商依赖伪装 `CLIENT_APP_ID`，服务端行为可能变化 | 逐查询读 `queryResultFormat`，JSON 解码路径永远可用，退化只影响性能不影响正确性 |
-| Snowflake 新增物理编码（例如新的 `TIMESTAMP` 结构体形态） | 归一化对未知形态直接报错并打印 IPC schema，fixtures 回归能第一时间发现 |
+| Snowflake 新增物理编码（例如新的 `TIMESTAMP` 结构体形态） | 归一化对未知形态直接报错并打印 IPC schema；类型矩阵测试每次 CI 都打真实服务端，能第一时间发现 |
 | arrow-rs 与 `adbc_core` 版本错位 | workspace 中由 `adbc_core` 的 arrow 版本反推锁定，CI 加 `cargo tree -d` 检查重复 arrow |
 | 密码认证被 Snowflake 彻底关闭 | 认证层已抽象为 `Authenticator` 枚举，JWT 在 M2 落地；文档明确要求服务账号设为 `TYPE = SERVICE` + Key-Pair |
 | 大结果内存 | 有界预取 channel；Arrow 分片直接零拷贝进 `RecordBatch`，JSON 分片解析后即释放原文 |
@@ -508,4 +605,5 @@ Snowflake 返回的 IPC stream 里，字段 metadata 含 `logicalType`、`scale`
 
 1. 结果格式参数的确切名字与传递位置（`SESSION_PARAMETERS` 还是查询 `parameters`），以及目标账号是否对 Arrow 有账号级限制。
 2. 目标账号中 `LEGACY_SERVICE` 用户的实际可用性（密码登录是否已被策略阻断），决定 M1 验证时是否需要提前引入 JWT。
-3. 当前服务端对 `TIMESTAMP_*` 返回 `Int64` 还是 `Struct` 编码（两者都实现，但 fixtures 需要以真实返回为准）。
+3. 当前服务端对 `TIMESTAMP_*` 返回 `Int64` 还是 `Struct` 编码（两者都实现，类型矩阵测试以真实返回为准）。
+4. 测试账号：需要 AWS / Azure / GCP 各一个（至少 AWS + Azure），每个账号一个 `LEGACY_SERVICE` 用户、一个专用测试库和一个小规格 warehouse。
