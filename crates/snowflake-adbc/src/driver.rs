@@ -25,7 +25,7 @@ impl Driver for SnowflakeDriver {
     type DatabaseType = SnowflakeDatabase;
 
     fn new_database(&mut self) -> Result<Self::DatabaseType> {
-        Ok(SnowflakeDatabase::new())
+        SnowflakeDatabase::new()
     }
 
     fn new_database_with_opts(
@@ -46,15 +46,11 @@ pub struct SnowflakeDatabase {
 }
 
 impl SnowflakeDatabase {
-    fn new() -> Self {
-        Self {
+    fn new() -> Result<Self> {
+        Ok(Self {
             settings: Settings::new(),
-            runtime: tokio::runtime::Builder::new_multi_thread()
-                .enable_all()
-                .thread_name("snowflake-adbc")
-                .build()
-                .expect("tokio runtime"),
-        }
+            runtime: build_runtime()?,
+        })
     }
 
     fn connect(&self) -> Result<Session> {
@@ -474,7 +470,7 @@ impl Statement for SnowflakeStatement {
             .handle
             .block_on(snowflake_arrow::collect(result, opts))
             .map_err(adbc_error)?;
-        Ok(affected_rows(&sql, &batches))
+        affected_rows(&sql, &batches)
     }
 
     fn execute_schema(&mut self) -> Result<Schema> {
@@ -523,7 +519,22 @@ impl Statement for SnowflakeStatement {
     }
 }
 
-fn affected_rows(sql: &str, batches: &[RecordBatch]) -> Option<i64> {
+fn build_runtime() -> Result<tokio::runtime::Runtime> {
+    tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .thread_name("snowflake-adbc")
+        .build()
+        .map_err(runtime_build_error)
+}
+
+fn runtime_build_error(err: std::io::Error) -> adbc_core::error::Error {
+    adbc_core::error::Error::with_message_and_status(
+        format!("tokio runtime: {err}"),
+        adbc_core::error::Status::Internal,
+    )
+}
+
+fn affected_rows(sql: &str, batches: &[RecordBatch]) -> Result<Option<i64>> {
     if let Some(batch) = batches
         .iter()
         .find(|batch| batch.num_rows() > 0 && batch.num_columns() > 0)
@@ -542,45 +553,43 @@ fn affected_rows(sql: &str, batches: &[RecordBatch]) -> Option<i64> {
         keyword.as_str(),
         "CREATE" | "ALTER" | "DROP" | "USE" | "GRANT" | "REVOKE" | "COMMENT" | "UNDROP"
     ) {
-        return Some(-1);
+        return Ok(Some(-1));
     }
-    None
+    Ok(None)
 }
 
-fn int_cell(batch: &RecordBatch, column: usize, row: usize) -> Option<i64> {
-    use arrow_array::cast::AsArray;
+fn int_cell(batch: &RecordBatch, column: usize, row: usize) -> Result<Option<i64>> {
     let array = batch.column(column);
     if array.is_null(row) {
-        return None;
+        return Ok(None);
     }
     match array.data_type() {
-        arrow_schema::DataType::Int64 => Some(
-            array
-                .as_primitive::<arrow_array::types::Int64Type>()
-                .value(row),
-        ),
+        arrow_schema::DataType::Int64 => Ok(Some(
+            prim::<arrow_array::types::Int64Type>(array)?.value(row),
+        )),
         arrow_schema::DataType::Decimal128(_, scale) => {
-            let value = array
-                .as_primitive::<arrow_array::types::Decimal128Type>()
-                .value(row);
-            let factor = 10i128.pow((*scale).unsigned_abs() as u32);
+            let value = prim::<arrow_array::types::Decimal128Type>(array)?.value(row);
+            let factor = pow10(*scale)?;
             let whole = if *scale >= 0 {
-                value / factor
+                value.checked_div(factor)
             } else {
-                value * factor
+                value.checked_mul(factor)
             };
-            i64::try_from(whole).ok()
+            let Some(whole) = whole else {
+                return Err(error::invalid("decimal row count overflows"));
+            };
+            Ok(i64::try_from(whole).ok())
         }
-        arrow_schema::DataType::Utf8 => array.as_string::<i32>().value(row).parse().ok(),
-        _ => None,
+        arrow_schema::DataType::Utf8 => Ok(string_array(array)?.value(row).parse().ok()),
+        _ => Ok(None),
     }
 }
 
 fn binds_from_batches(batches: &[RecordBatch]) -> Result<Vec<Bind>> {
-    if batches.is_empty() {
+    let Some(first) = batches.first() else {
         return Ok(Vec::new());
-    }
-    let columns = batches[0].num_columns();
+    };
+    let columns = first.num_columns();
     let total_rows: usize = batches.iter().map(|batch| batch.num_rows()).sum();
     if total_rows == 0 {
         return Err(error::invalid("bind batch has no rows"));
@@ -616,7 +625,6 @@ fn cell_to_bind(
     field: &arrow_schema::Field,
     row: usize,
 ) -> Result<Bind> {
-    use arrow_array::cast::AsArray;
     if array.is_null(row) {
         return Ok(Bind::Null);
     }
@@ -625,9 +633,9 @@ fn cell_to_bind(
         .get(snowflake_arrow::MD_LOGICAL_TYPE)
         .map(String::as_str);
     let bind = match array.data_type() {
-        arrow_schema::DataType::Utf8 => Bind::Text(array.as_string::<i32>().value(row).to_string()),
+        arrow_schema::DataType::Utf8 => Bind::Text(string_array(array)?.value(row).to_string()),
         arrow_schema::DataType::LargeUtf8 => {
-            Bind::Text(array.as_string::<i64>().value(row).to_string())
+            Bind::Text(large_string_array(array)?.value(row).to_string())
         }
         arrow_schema::DataType::Int8
         | arrow_schema::DataType::Int16
@@ -638,41 +646,30 @@ fn cell_to_bind(
         | arrow_schema::DataType::UInt32
         | arrow_schema::DataType::UInt64 => Bind::Fixed(integer_string(array, row)?),
         arrow_schema::DataType::Decimal128(_, scale) => {
-            let unscaled = array
-                .as_primitive::<arrow_array::types::Decimal128Type>()
-                .value(row);
-            Bind::Fixed(format_decimal(unscaled, *scale))
+            let unscaled = prim::<arrow_array::types::Decimal128Type>(array)?.value(row);
+            Bind::Fixed(format_decimal(unscaled, *scale)?)
         }
         arrow_schema::DataType::Float32 => Bind::Real(
-            array
-                .as_primitive::<arrow_array::types::Float32Type>()
+            prim::<arrow_array::types::Float32Type>(array)?
                 .value(row)
                 .to_string(),
         ),
         arrow_schema::DataType::Float64 => Bind::Real(
-            array
-                .as_primitive::<arrow_array::types::Float64Type>()
+            prim::<arrow_array::types::Float64Type>(array)?
                 .value(row)
                 .to_string(),
         ),
-        arrow_schema::DataType::Boolean => Bind::Boolean(array.as_boolean().value(row)),
-        arrow_schema::DataType::Date32 => Bind::Date(
-            array
-                .as_primitive::<arrow_array::types::Date32Type>()
-                .value(row),
-        ),
+        arrow_schema::DataType::Boolean => Bind::Boolean(boolean_array(array)?.value(row)),
+        arrow_schema::DataType::Date32 => {
+            Bind::Date(prim::<arrow_array::types::Date32Type>(array)?.value(row))
+        }
         arrow_schema::DataType::Date64 => {
-            let millis = array
-                .as_primitive::<arrow_array::types::Date64Type>()
-                .value(row);
+            let millis = prim::<arrow_array::types::Date64Type>(array)?.value(row);
             Bind::Date((millis / 86_400_000) as i32)
         }
-        arrow_schema::DataType::Time64(unit) => {
-            let value = array.as_primitive::<arrow_array::types::Time64NanosecondType>();
-            let _ = (unit, value);
+        arrow_schema::DataType::Time32(_) | arrow_schema::DataType::Time64(_) => {
             Bind::Time(time_to_nanos(array, row)?)
         }
-        arrow_schema::DataType::Time32(_) => Bind::Time(time_to_nanos(array, row)?),
         arrow_schema::DataType::Timestamp(unit, tz) => {
             let nanos = timestamp_to_nanos(array, row, unit)?;
             if logical == Some("timestamp_tz") {
@@ -686,9 +683,7 @@ fn cell_to_bind(
                 Bind::TimestampNtz(nanos)
             }
         }
-        arrow_schema::DataType::Binary => {
-            Bind::Binary(array.as_binary::<i32>().value(row).to_vec())
-        }
+        arrow_schema::DataType::Binary => Bind::Binary(binary_array(array)?.value(row).to_vec()),
         arrow_schema::DataType::Null => Bind::Null,
         other => {
             return Err(error::invalid(format!("cannot bind arrow type {other:?}")));
@@ -698,38 +693,29 @@ fn cell_to_bind(
 }
 
 fn integer_string(array: &arrow_array::ArrayRef, row: usize) -> Result<String> {
-    use arrow_array::cast::AsArray;
     let text = match array.data_type() {
-        arrow_schema::DataType::Int8 => array
-            .as_primitive::<arrow_array::types::Int8Type>()
+        arrow_schema::DataType::Int8 => prim::<arrow_array::types::Int8Type>(array)?
             .value(row)
             .to_string(),
-        arrow_schema::DataType::Int16 => array
-            .as_primitive::<arrow_array::types::Int16Type>()
+        arrow_schema::DataType::Int16 => prim::<arrow_array::types::Int16Type>(array)?
             .value(row)
             .to_string(),
-        arrow_schema::DataType::Int32 => array
-            .as_primitive::<arrow_array::types::Int32Type>()
+        arrow_schema::DataType::Int32 => prim::<arrow_array::types::Int32Type>(array)?
             .value(row)
             .to_string(),
-        arrow_schema::DataType::Int64 => array
-            .as_primitive::<arrow_array::types::Int64Type>()
+        arrow_schema::DataType::Int64 => prim::<arrow_array::types::Int64Type>(array)?
             .value(row)
             .to_string(),
-        arrow_schema::DataType::UInt8 => array
-            .as_primitive::<arrow_array::types::UInt8Type>()
+        arrow_schema::DataType::UInt8 => prim::<arrow_array::types::UInt8Type>(array)?
             .value(row)
             .to_string(),
-        arrow_schema::DataType::UInt16 => array
-            .as_primitive::<arrow_array::types::UInt16Type>()
+        arrow_schema::DataType::UInt16 => prim::<arrow_array::types::UInt16Type>(array)?
             .value(row)
             .to_string(),
-        arrow_schema::DataType::UInt32 => array
-            .as_primitive::<arrow_array::types::UInt32Type>()
+        arrow_schema::DataType::UInt32 => prim::<arrow_array::types::UInt32Type>(array)?
             .value(row)
             .to_string(),
-        arrow_schema::DataType::UInt64 => array
-            .as_primitive::<arrow_array::types::UInt64Type>()
+        arrow_schema::DataType::UInt64 => prim::<arrow_array::types::UInt64Type>(array)?
             .value(row)
             .to_string(),
         other => return Err(error::invalid(format!("not an integer: {other:?}"))),
@@ -737,13 +723,16 @@ fn integer_string(array: &arrow_array::ArrayRef, row: usize) -> Result<String> {
     Ok(text)
 }
 
-fn format_decimal(unscaled: i128, scale: i8) -> String {
+fn format_decimal(unscaled: i128, scale: i8) -> Result<String> {
     if scale == 0 {
-        return unscaled.to_string();
+        return Ok(unscaled.to_string());
     }
     if scale < 0 {
-        let factor = 10i128.pow(scale.unsigned_abs() as u32);
-        return (unscaled * factor).to_string();
+        let factor = pow10(scale)?;
+        let scaled = unscaled
+            .checked_mul(factor)
+            .ok_or_else(|| error::invalid("decimal value overflows"))?;
+        return Ok(scaled.to_string());
     }
     let negative = unscaled < 0;
     let digits = unscaled.unsigned_abs().to_string();
@@ -755,46 +744,46 @@ fn format_decimal(unscaled: i128, scale: i8) -> String {
         format!("{}.{}", &digits[..split], &digits[split..])
     };
     if negative {
-        format!("-{text}")
+        Ok(format!("-{text}"))
     } else {
-        text
+        Ok(text)
     }
 }
 
+fn pow10(scale: i8) -> Result<i128> {
+    10i128
+        .checked_pow(u32::from(scale.unsigned_abs()))
+        .ok_or_else(|| error::invalid(format!("decimal scale {scale} overflows")))
+}
+
 fn time_to_nanos(array: &arrow_array::ArrayRef, row: usize) -> Result<i64> {
-    use arrow_array::cast::AsArray;
-    use arrow_schema::TimeUnit;
-    match array.data_type() {
-        arrow_schema::DataType::Time32(TimeUnit::Second) => scale_time(
-            i64::from(
-                array
-                    .as_primitive::<arrow_array::types::Time32SecondType>()
-                    .value(row),
-            ),
+    use arrow_schema::{DataType, TimeUnit};
+    let (value, unit) = match array.data_type() {
+        DataType::Time32(TimeUnit::Second) => (
+            i64::from(prim::<arrow_array::types::Time32SecondType>(array)?.value(row)),
             TimeUnit::Second,
         ),
-        arrow_schema::DataType::Time32(TimeUnit::Millisecond) => scale_time(
-            i64::from(
-                array
-                    .as_primitive::<arrow_array::types::Time32MillisecondType>()
-                    .value(row),
-            ),
+        DataType::Time32(TimeUnit::Millisecond) => (
+            i64::from(prim::<arrow_array::types::Time32MillisecondType>(array)?.value(row)),
             TimeUnit::Millisecond,
         ),
-        arrow_schema::DataType::Time64(TimeUnit::Microsecond) => scale_time(
-            array
-                .as_primitive::<arrow_array::types::Time64MicrosecondType>()
-                .value(row),
+        DataType::Time32(unit) => {
+            return Err(error::invalid(format!("unsupported time unit {unit:?}")));
+        }
+        DataType::Time64(TimeUnit::Microsecond) => (
+            prim::<arrow_array::types::Time64MicrosecondType>(array)?.value(row),
             TimeUnit::Microsecond,
         ),
-        arrow_schema::DataType::Time64(TimeUnit::Nanosecond) => scale_time(
-            array
-                .as_primitive::<arrow_array::types::Time64NanosecondType>()
-                .value(row),
+        DataType::Time64(TimeUnit::Nanosecond) => (
+            prim::<arrow_array::types::Time64NanosecondType>(array)?.value(row),
             TimeUnit::Nanosecond,
         ),
-        other => Err(error::invalid(format!("not a time: {other:?}"))),
-    }
+        DataType::Time64(unit) => {
+            return Err(error::invalid(format!("unsupported time unit {unit:?}")));
+        }
+        other => return Err(error::invalid(format!("not a time: {other:?}"))),
+    };
+    scale_time(value, unit)
 }
 
 fn scale_time(value: i64, unit: arrow_schema::TimeUnit) -> Result<i64> {
@@ -813,25 +802,244 @@ fn timestamp_to_nanos(
     row: usize,
     unit: &arrow_schema::TimeUnit,
 ) -> Result<i64> {
-    use arrow_array::cast::AsArray;
     use arrow_schema::TimeUnit;
     let value = match unit {
-        TimeUnit::Second => array
-            .as_primitive::<arrow_array::types::TimestampSecondType>()
-            .value(row),
-        TimeUnit::Millisecond => array
-            .as_primitive::<arrow_array::types::TimestampMillisecondType>()
-            .value(row),
-        TimeUnit::Microsecond => array
-            .as_primitive::<arrow_array::types::TimestampMicrosecondType>()
-            .value(row),
-        TimeUnit::Nanosecond => array
-            .as_primitive::<arrow_array::types::TimestampNanosecondType>()
-            .value(row),
+        TimeUnit::Second => prim::<arrow_array::types::TimestampSecondType>(array)?.value(row),
+        TimeUnit::Millisecond => {
+            prim::<arrow_array::types::TimestampMillisecondType>(array)?.value(row)
+        }
+        TimeUnit::Microsecond => {
+            prim::<arrow_array::types::TimestampMicrosecondType>(array)?.value(row)
+        }
+        TimeUnit::Nanosecond => {
+            prim::<arrow_array::types::TimestampNanosecondType>(array)?.value(row)
+        }
     };
     scale_time(value, *unit)
 }
 
+fn prim<T: arrow_array::ArrowPrimitiveType>(
+    array: &arrow_array::ArrayRef,
+) -> Result<&arrow_array::PrimitiveArray<T>> {
+    use arrow_array::Array;
+    array.as_any().downcast_ref().ok_or_else(|| {
+        error::invalid(format!(
+            "arrow array {:?} is not {}",
+            array.data_type(),
+            std::any::type_name::<T>()
+        ))
+    })
+}
+
+fn string_array(array: &arrow_array::ArrayRef) -> Result<&arrow_array::StringArray> {
+    use arrow_array::Array;
+    array
+        .as_any()
+        .downcast_ref()
+        .ok_or_else(|| error::invalid(format!("arrow array {:?} is not utf8", array.data_type())))
+}
+
+fn large_string_array(array: &arrow_array::ArrayRef) -> Result<&arrow_array::LargeStringArray> {
+    use arrow_array::Array;
+    array.as_any().downcast_ref().ok_or_else(|| {
+        error::invalid(format!(
+            "arrow array {:?} is not large utf8",
+            array.data_type()
+        ))
+    })
+}
+
+fn boolean_array(array: &arrow_array::ArrayRef) -> Result<&arrow_array::BooleanArray> {
+    use arrow_array::Array;
+    array.as_any().downcast_ref().ok_or_else(|| {
+        error::invalid(format!(
+            "arrow array {:?} is not boolean",
+            array.data_type()
+        ))
+    })
+}
+
+fn binary_array(array: &arrow_array::ArrayRef) -> Result<&arrow_array::BinaryArray> {
+    use arrow_array::Array;
+    array
+        .as_any()
+        .downcast_ref()
+        .ok_or_else(|| error::invalid(format!("arrow array {:?} is not binary", array.data_type())))
+}
+
 pub fn quote_ident(name: &str) -> String {
     format!("\"{}\"", name.replace('"', "\"\""))
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+
+    use adbc_core::error::Status;
+    use adbc_core::Driver;
+    use arrow_array::{
+        ArrayRef, BinaryArray, BooleanArray, Date32Array, Date64Array, Decimal128Array,
+        Float64Array, Int64Array, LargeStringArray, RecordBatch, StringArray,
+        Time32MillisecondArray, Time32SecondArray, Time64MicrosecondArray, Time64NanosecondArray,
+        TimestampMicrosecondArray, TimestampMillisecondArray, TimestampNanosecondArray,
+        TimestampSecondArray,
+    };
+    use arrow_schema::{Field, Schema, TimeUnit};
+    use snowflake_core::Bind;
+
+    use super::*;
+
+    fn one_column(array: ArrayRef) -> RecordBatch {
+        let field = Field::new("c", array.data_type().clone(), true);
+        RecordBatch::try_new(Arc::new(Schema::new(vec![field])), vec![array]).unwrap()
+    }
+
+    fn bound(array: ArrayRef) -> Bind {
+        let binds = binds_from_batches(&[one_column(array)]).unwrap();
+        assert_eq!(binds.len(), 1);
+        binds.into_iter().next().unwrap()
+    }
+
+    #[test]
+    fn database_build_returns_a_runtime() {
+        let mut driver = SnowflakeDriver;
+        driver.new_database().unwrap();
+    }
+
+    #[test]
+    fn runtime_build_failure_is_an_error() {
+        let err = runtime_build_error(std::io::Error::other("no threads"));
+        assert_eq!(err.status, Status::Internal);
+        assert!(err.to_string().contains("no threads"), "{err}");
+    }
+
+    #[test]
+    fn every_time_unit_binds_as_nanoseconds() {
+        let cases: [(ArrayRef, i64); 4] = [
+            (
+                Arc::new(Time32SecondArray::from(vec![2_i32])),
+                2_000_000_000,
+            ),
+            (
+                Arc::new(Time32MillisecondArray::from(vec![2_i32])),
+                2_000_000,
+            ),
+            (Arc::new(Time64MicrosecondArray::from(vec![2_i64])), 2_000),
+            (Arc::new(Time64NanosecondArray::from(vec![2_i64])), 2),
+        ];
+        for (array, nanos) in cases {
+            match bound(array) {
+                Bind::Time(value) => assert_eq!(value, nanos),
+                other => panic!("expected time bind, got {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn every_timestamp_unit_binds() {
+        let ntz: [(ArrayRef, i64); 4] = [
+            (
+                Arc::new(TimestampSecondArray::from(vec![3_i64])),
+                3_000_000_000,
+            ),
+            (
+                Arc::new(TimestampMillisecondArray::from(vec![3_i64])),
+                3_000_000,
+            ),
+            (
+                Arc::new(TimestampMicrosecondArray::from(vec![3_i64])),
+                3_000,
+            ),
+            (Arc::new(TimestampNanosecondArray::from(vec![3_i64])), 3),
+        ];
+        for (array, nanos) in ntz {
+            match bound(array) {
+                Bind::TimestampNtz(value) => assert_eq!(value, nanos),
+                other => panic!("expected timestamp_ntz, got {other:?}"),
+            }
+        }
+
+        let ltz = Arc::new(TimestampMillisecondArray::from(vec![4_i64]).with_timezone("UTC"));
+        match bound(ltz) {
+            Bind::TimestampLtz(value) => assert_eq!(value, 4_000_000),
+            other => panic!("expected timestamp_ltz, got {other:?}"),
+        }
+
+        let mut metadata = std::collections::HashMap::new();
+        metadata.insert(
+            snowflake_arrow::MD_LOGICAL_TYPE.to_string(),
+            "timestamp_tz".into(),
+        );
+        let array = Arc::new(TimestampMicrosecondArray::from(vec![5_i64])) as ArrayRef;
+        let field = Field::new("c", array.data_type().clone(), true).with_metadata(metadata);
+        let batch = RecordBatch::try_new(Arc::new(Schema::new(vec![field])), vec![array]).unwrap();
+        let binds = binds_from_batches(&[batch]).unwrap();
+        match &binds[0] {
+            Bind::TimestampTz {
+                nanos,
+                offset_minutes,
+            } => {
+                assert_eq!(*nanos, 5_000);
+                assert_eq!(*offset_minutes, 0);
+            }
+            other => panic!("expected timestamp_tz, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn timestamp_unit_mismatch_is_an_error() {
+        let array = Arc::new(TimestampSecondArray::from(vec![1_i64])) as ArrayRef;
+        let err = timestamp_to_nanos(&array, 0, &TimeUnit::Millisecond).unwrap_err();
+        assert!(err.to_string().contains("is not"), "{err}");
+    }
+
+    #[test]
+    fn primitive_downcast_mismatch_is_an_error() {
+        let array = Arc::new(Float64Array::from(vec![1.0_f64])) as ArrayRef;
+        let err = prim::<arrow_array::types::Int64Type>(&array).unwrap_err();
+        assert!(err.to_string().contains("is not"), "{err}");
+    }
+
+    #[test]
+    fn decimal_scale_that_overflows_pow_is_an_error() {
+        let err = format_decimal(1, -40).unwrap_err();
+        assert!(err.to_string().contains("scale"), "{err}");
+        assert_eq!(format_decimal(12340, 2).unwrap(), "123.40");
+    }
+
+    #[test]
+    fn other_scalar_binds_do_not_panic() {
+        assert!(matches!(
+            bound(Arc::new(StringArray::from(vec!["a"]))),
+            Bind::Text(text) if text == "a"
+        ));
+        assert!(matches!(
+            bound(Arc::new(LargeStringArray::from(vec!["b"]))),
+            Bind::Text(text) if text == "b"
+        ));
+        assert!(matches!(
+            bound(Arc::new(BooleanArray::from(vec![true]))),
+            Bind::Boolean(true)
+        ));
+        assert!(matches!(
+            bound(Arc::new(Date32Array::from(vec![1_i32]))),
+            Bind::Date(1)
+        ));
+        assert!(matches!(
+            bound(Arc::new(Date64Array::from(vec![86_400_000_i64]))),
+            Bind::Date(1)
+        ));
+        assert!(matches!(
+            bound(Arc::new(BinaryArray::from_iter_values([b"xy".as_slice()]))),
+            Bind::Binary(bytes) if bytes == b"xy"
+        ));
+        let decimal = Decimal128Array::from(vec![12340_i128])
+            .with_precision_and_scale(10, 2)
+            .unwrap();
+        assert!(matches!(bound(Arc::new(decimal)), Bind::Fixed(text) if text == "123.40"));
+        assert!(matches!(
+            bound(Arc::new(Int64Array::from(vec![7_i64]))),
+            Bind::Fixed(text) if text == "7"
+        ));
+    }
 }

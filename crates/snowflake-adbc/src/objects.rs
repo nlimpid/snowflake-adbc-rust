@@ -4,7 +4,9 @@ use std::collections::BTreeMap;
 use std::sync::Arc;
 
 use adbc_core::options::ObjectDepth;
-use arrow_array::{ArrayRef, Int32Array, ListArray, RecordBatch, StringArray, StructArray};
+use arrow_array::{
+    Array, ArrayRef, Int32Array, LargeStringArray, ListArray, RecordBatch, StringArray, StructArray,
+};
 use arrow_buffer::{NullBuffer, OffsetBuffer};
 use arrow_schema::{DataType, Field, FieldRef, Fields, Schema};
 use snowflake_arrow::ArrowOptions;
@@ -531,7 +533,7 @@ fn query_rows(
         for row in 0..batch.num_rows() {
             let mut cells = Vec::with_capacity(batch.num_columns());
             for column in 0..batch.num_columns() {
-                cells.push(cell_string(batch.column(column).as_ref(), row));
+                cells.push(cell_string(batch.column(column).as_ref(), row)?);
             }
             rows.push(cells);
         }
@@ -539,15 +541,36 @@ fn query_rows(
     Ok(rows)
 }
 
-fn cell_string(array: &dyn arrow_array::Array, row: usize) -> Option<String> {
-    use arrow_array::cast::AsArray;
+fn cell_string(
+    array: &dyn arrow_array::Array,
+    row: usize,
+) -> adbc_core::error::Result<Option<String>> {
     if array.is_null(row) {
-        return None;
+        return Ok(None);
     }
     match array.data_type() {
-        DataType::Utf8 => Some(array.as_string::<i32>().value(row).to_string()),
-        DataType::LargeUtf8 => Some(array.as_string::<i64>().value(row).to_string()),
-        _ => None,
+        DataType::Utf8 => {
+            let values = array
+                .as_any()
+                .downcast_ref::<StringArray>()
+                .ok_or_else(|| {
+                    error::invalid(format!("arrow array {:?} is not utf8", array.data_type()))
+                })?;
+            Ok(Some(values.value(row).to_string()))
+        }
+        DataType::LargeUtf8 => {
+            let values = array
+                .as_any()
+                .downcast_ref::<LargeStringArray>()
+                .ok_or_else(|| {
+                    error::invalid(format!(
+                        "arrow array {:?} is not large utf8",
+                        array.data_type()
+                    ))
+                })?;
+            Ok(Some(values.value(row).to_string()))
+        }
+        _ => Ok(None),
     }
 }
 
