@@ -9,7 +9,7 @@ use arrow_array::{
 };
 use arrow_buffer::{NullBuffer, OffsetBuffer};
 use arrow_schema::{DataType, Field, FieldRef, Fields, Schema};
-use snowflake_arrow::ArrowOptions;
+use snowflake_arrow::{block_on_runtime, ArrowOptions};
 use snowflake_core::Session;
 
 use crate::error::{self, adbc_error};
@@ -17,7 +17,7 @@ use crate::error::{self, adbc_error};
 #[allow(clippy::too_many_arguments)]
 pub fn objects_reader(
     session: &Session,
-    handle: &tokio::runtime::Handle,
+    runtime: &tokio::runtime::Runtime,
     opts: &ArrowOptions,
     depth: ObjectDepth,
     catalog: Option<&str>,
@@ -36,7 +36,7 @@ pub fn objects_reader(
     let mut catalogs: BTreeMap<String, BTreeMap<String, BTreeMap<String, Table>>> = BTreeMap::new();
     let catalog_rows = query_rows(
         session,
-        handle,
+        runtime,
         opts,
         &format!(
             "SELECT database_name::varchar FROM information_schema.databases WHERE 1 = 1{}",
@@ -51,7 +51,7 @@ pub fn objects_reader(
     if want_schemas {
         let rows = query_rows(
             session,
-            handle,
+            runtime,
             opts,
             &format!(
                 "SELECT catalog_name::varchar, schema_name::varchar \
@@ -88,7 +88,7 @@ pub fn objects_reader(
         };
         let rows = query_rows(
             session,
-            handle,
+            runtime,
             opts,
             &format!(
                 "SELECT table_catalog::varchar, table_schema::varchar, table_name::varchar, table_type::varchar \
@@ -124,7 +124,7 @@ pub fn objects_reader(
     if want_columns {
         let rows = query_rows(
             session,
-            handle,
+            runtime,
             opts,
             &format!(
                 "SELECT table_catalog::varchar, table_schema::varchar, table_name::varchar, \
@@ -518,15 +518,12 @@ fn nulls(data_type: DataType, len: usize) -> ArrayRef {
 
 fn query_rows(
     session: &Session,
-    handle: &tokio::runtime::Handle,
+    runtime: &tokio::runtime::Runtime,
     opts: &ArrowOptions,
     sql: &str,
 ) -> adbc_core::error::Result<Vec<Vec<Option<String>>>> {
-    let result = handle
-        .block_on(session.query(sql).execute())
-        .map_err(adbc_error)?;
-    let batches = handle
-        .block_on(snowflake_arrow::collect(result, opts.clone()))
+    let result = block_on_runtime(runtime, session.query(sql).execute()).map_err(adbc_error)?;
+    let batches = block_on_runtime(runtime, snowflake_arrow::collect(result, opts.clone()))
         .map_err(adbc_error)?;
     let mut rows = Vec::new();
     for batch in batches {

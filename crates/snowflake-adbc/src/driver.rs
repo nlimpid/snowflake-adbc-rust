@@ -10,7 +10,7 @@ use adbc_core::options::{
 use adbc_core::{Connection, Database, Driver, Optionable, PartitionedResult, Statement};
 use arrow_array::{RecordBatch, RecordBatchReader};
 use arrow_schema::Schema;
-use snowflake_arrow::{schema_for, ArrowOptions};
+use snowflake_arrow::{block_on_runtime, schema_for, ArrowOptions, SharedRuntime};
 use snowflake_core::{Bind, Session};
 
 use crate::error::{self, adbc_error};
@@ -42,20 +42,20 @@ impl Driver for SnowflakeDriver {
 
 pub struct SnowflakeDatabase {
     settings: Settings,
-    runtime: tokio::runtime::Runtime,
+    runtime: Arc<SharedRuntime>,
 }
 
 impl SnowflakeDatabase {
     fn new() -> Result<Self> {
         Ok(Self {
             settings: Settings::new(),
-            runtime: build_runtime()?,
+            runtime: Arc::new(SharedRuntime::new(build_runtime()?)),
         })
     }
 
     fn connect(&self) -> Result<Session> {
         let client = self.settings.build_client()?;
-        self.runtime.block_on(client.connect()).map_err(adbc_error)
+        block_on_runtime(&self.runtime, client.connect()).map_err(adbc_error)
     }
 }
 
@@ -94,7 +94,7 @@ impl Database for SnowflakeDatabase {
         let session = self.connect()?;
         Ok(SnowflakeConnection {
             session,
-            handle: self.runtime.handle().clone(),
+            runtime: Arc::clone(&self.runtime),
             arrow: self.settings.arrow_options(),
             autocommit: true,
             options: HashMap::new(),
@@ -115,7 +115,7 @@ impl Database for SnowflakeDatabase {
 
 pub struct SnowflakeConnection {
     session: Session,
-    handle: tokio::runtime::Handle,
+    runtime: Arc<SharedRuntime>,
     arrow: ArrowOptions,
     autocommit: bool,
     options: HashMap<String, String>,
@@ -130,11 +130,11 @@ impl std::fmt::Debug for SnowflakeConnection {
 }
 
 impl SnowflakeConnection {
-    fn block<T>(
+    fn block<T: Send>(
         &self,
-        future: impl std::future::Future<Output = snowflake_core::Result<T>>,
+        future: impl std::future::Future<Output = snowflake_core::Result<T>> + Send,
     ) -> Result<T> {
-        self.handle.block_on(future).map_err(adbc_error)
+        block_on_runtime(&self.runtime, future).map_err(adbc_error)
     }
 
     fn arrow_opts(&self) -> ArrowOptions {
@@ -224,7 +224,7 @@ impl Connection for SnowflakeConnection {
     fn new_statement(&mut self) -> Result<Self::StatementType> {
         Ok(SnowflakeStatement {
             session: self.session.clone(),
-            handle: self.handle.clone(),
+            runtime: Arc::clone(&self.runtime),
             arrow: self.arrow_opts(),
             sql: None,
             parameter_schema: None,
@@ -256,7 +256,7 @@ impl Connection for SnowflakeConnection {
     ) -> Result<Box<dyn RecordBatchReader + Send + 'static>> {
         objects_reader(
             &self.session,
-            &self.handle,
+            &self.runtime,
             &self.arrow_opts(),
             depth,
             catalog,
@@ -328,7 +328,7 @@ impl Connection for SnowflakeConnection {
 
 pub struct SnowflakeStatement {
     session: Session,
-    handle: tokio::runtime::Handle,
+    runtime: Arc<SharedRuntime>,
     arrow: ArrowOptions,
     sql: Option<String>,
     parameter_schema: Option<Schema>,
@@ -344,11 +344,11 @@ impl SnowflakeStatement {
             .ok_or_else(|| error::invalid_state("statement has no SQL"))
     }
 
-    fn block<T>(
+    fn block<T: Send>(
         &self,
-        future: impl std::future::Future<Output = snowflake_core::Result<T>>,
+        future: impl std::future::Future<Output = snowflake_core::Result<T>> + Send,
     ) -> Result<T> {
-        self.handle.block_on(future).map_err(adbc_error)
+        block_on_runtime(&self.runtime, future).map_err(adbc_error)
     }
 
     fn run(&self, describe_only: bool) -> Result<snowflake_core::QueryResult> {
@@ -456,7 +456,7 @@ impl Statement for SnowflakeStatement {
             schema_for(result.row_type(), result.parameters(), &opts).map_err(adbc_error)?;
         let stream = snowflake_arrow::record_batches_with(result, opts);
         Ok(Box::new(snowflake_arrow::BlockingBatchReader::new(
-            self.handle.clone(),
+            Arc::clone(&self.runtime),
             Arc::new(schema),
             Box::pin(stream),
         )))
@@ -466,10 +466,7 @@ impl Statement for SnowflakeStatement {
         let sql = self.sql()?.to_string();
         let result = self.run(false)?;
         let opts = self.arrow.clone();
-        let batches = self
-            .handle
-            .block_on(snowflake_arrow::collect(result, opts))
-            .map_err(adbc_error)?;
+        let batches = self.block(snowflake_arrow::collect(result, opts))?;
         affected_rows(&sql, &batches)
     }
 
@@ -1041,5 +1038,88 @@ mod tests {
             bound(Arc::new(Int64Array::from(vec![7_i64]))),
             Bind::Fixed(text) if text == "7"
         ));
+    }
+
+    fn value_on(runtime: &tokio::runtime::Runtime) -> i32 {
+        block_on_runtime(runtime, async {
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+            9
+        })
+    }
+
+    #[test]
+    fn sync_bridge_works_outside_and_inside_other_runtimes() {
+        let database = SnowflakeDatabase::new().unwrap();
+        assert_eq!(value_on(&database.runtime), 9);
+
+        let multi = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .enable_all()
+            .build()
+            .unwrap();
+        multi.block_on(async {
+            assert_eq!(value_on(&database.runtime), 9);
+        });
+
+        let current = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        current.block_on(async {
+            assert_eq!(value_on(&database.runtime), 9);
+        });
+
+        // Re-enter this driver's own runtime.
+        block_on_runtime(&database.runtime, async {
+            assert_eq!(value_on(&database.runtime), 9);
+        });
+    }
+
+    #[test]
+    fn reader_connection_and_statement_outlive_the_database() {
+        let database = SnowflakeDatabase::new().unwrap();
+        // Same `Arc` `new_connection` and `new_statement` store.
+        let connection_runtime = Arc::clone(&database.runtime);
+        let statement_runtime = Arc::clone(&connection_runtime);
+        let schema = Arc::new(Schema::empty());
+        let batch = RecordBatch::new_empty(Arc::clone(&schema));
+        let stream = futures::stream::once(async move { Ok::<_, snowflake_core::Error>(batch) });
+        let mut reader = snowflake_arrow::BlockingBatchReader::new(
+            Arc::clone(&statement_runtime),
+            schema,
+            Box::pin(stream),
+        );
+        drop(database);
+        assert_eq!(value_on(&connection_runtime), 9);
+        assert_eq!(value_on(&statement_runtime), 9);
+        assert!(reader.next().unwrap().is_ok());
+        assert!(reader.next().is_none());
+    }
+
+    #[test]
+    fn driver_calls_inside_another_runtime_do_not_panic() {
+        let run = || {
+            let mut driver = SnowflakeDriver;
+            let database = driver.new_database().unwrap();
+            let err = database.new_connection().unwrap_err();
+            assert!(err.to_string().contains("account"), "{err}");
+            assert_eq!(value_on(&database.runtime), 9);
+        };
+        run();
+        let multi = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .enable_all()
+            .build()
+            .unwrap();
+        multi.block_on(async {
+            run();
+        });
+        let current = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        current.block_on(async {
+            run();
+        });
     }
 }

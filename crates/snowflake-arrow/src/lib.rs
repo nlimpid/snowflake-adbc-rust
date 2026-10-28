@@ -13,7 +13,9 @@ pub use schema::{
     data_type_for, field_for, schema_for, timestamp_unit, ArrowOptions, TimestampTzMode,
     MD_BYTE_LENGTH, MD_LENGTH, MD_LOGICAL_TYPE, MD_PRECISION, MD_SCALE,
 };
-pub use stream::{record_batches, record_batches_with, BlockingBatchReader};
+pub use stream::{
+    block_on_runtime, record_batches, record_batches_with, BlockingBatchReader, SharedRuntime,
+};
 
 pub const ARROW_RS_VERSION: &str = "59.3.1";
 
