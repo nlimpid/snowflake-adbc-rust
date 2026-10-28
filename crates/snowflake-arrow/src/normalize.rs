@@ -5,9 +5,9 @@ use std::sync::Arc;
 
 use arrow_array::builder::{Decimal128Builder, Float64Builder, Int64Builder};
 use arrow_array::{
-    cast::AsArray, types::*, Array, ArrayRef, BinaryArray, BooleanArray, Date32Array,
-    Decimal128Array, FixedSizeListArray, Float64Array, Int32Array, Int64Array, LargeBinaryArray,
-    LargeStringArray, RecordBatch, StringArray, StructArray, Time64NanosecondArray,
+    types::*, Array, ArrayRef, BinaryArray, BooleanArray, Date32Array, Decimal128Array,
+    FixedSizeListArray, Float64Array, Int32Array, Int64Array, LargeBinaryArray, LargeStringArray,
+    RecordBatch, StringArray, StructArray, Time64NanosecondArray,
 };
 use arrow_ipc::reader::StreamReader;
 use arrow_schema::{DataType, Field, Fields, Schema, TimeUnit};
@@ -278,12 +278,12 @@ fn fixed_low_precision(values: &[Option<i128>], column: &RowType, scale: i64) ->
 fn signed_values(array: &ArrayRef, column: &RowType) -> Result<Vec<Option<i128>>> {
     let mut out = Vec::with_capacity(array.len());
     match array.data_type() {
-        DataType::Int8 => push_primitive::<Int8Type>(array, &mut out),
-        DataType::Int16 => push_primitive::<Int16Type>(array, &mut out),
-        DataType::Int32 => push_primitive::<Int32Type>(array, &mut out),
-        DataType::Int64 => push_primitive::<Int64Type>(array, &mut out),
+        DataType::Int8 => push_primitive::<Int8Type>(array, column, &mut out)?,
+        DataType::Int16 => push_primitive::<Int16Type>(array, column, &mut out)?,
+        DataType::Int32 => push_primitive::<Int32Type>(array, column, &mut out)?,
+        DataType::Int64 => push_primitive::<Int64Type>(array, column, &mut out)?,
         DataType::Decimal128(_, _) => {
-            let decimal = array.as_primitive::<Decimal128Type>();
+            let decimal = prim::<Decimal128Type>(array, column)?;
             for index in 0..decimal.len() {
                 out.push(if decimal.is_null(index) {
                     None
@@ -297,12 +297,12 @@ fn signed_values(array: &ArrayRef, column: &RowType) -> Result<Vec<Option<i128>>
     Ok(out)
 }
 
-fn push_primitive<T>(array: &ArrayRef, out: &mut Vec<Option<i128>>)
+fn push_primitive<T>(array: &ArrayRef, column: &RowType, out: &mut Vec<Option<i128>>) -> Result<()>
 where
     T: ArrowPrimitiveType,
     T::Native: Into<i128>,
 {
-    let primitive = array.as_primitive::<T>();
+    let primitive = prim::<T>(array, column)?;
     for index in 0..primitive.len() {
         out.push(if primitive.is_null(index) {
             None
@@ -310,6 +310,17 @@ where
             Some(primitive.value(index).into())
         });
     }
+    Ok(())
+}
+
+fn prim<'a, T: ArrowPrimitiveType>(
+    array: &'a ArrayRef,
+    column: &RowType,
+) -> Result<&'a arrow_array::PrimitiveArray<T>> {
+    array
+        .as_any()
+        .downcast_ref()
+        .ok_or_else(|| physical_rejected(column, array.data_type()))
 }
 
 fn expect_float64(array: &ArrayRef, column: &RowType) -> Result<ArrayRef> {
@@ -411,13 +422,11 @@ fn normalize_time(array: &ArrayRef, field: &Field, column: &RowType) -> Result<A
     }
     let scale = meta_i64(field, "scale").or(column.scale).unwrap_or(9);
     let values = match array.data_type() {
-        DataType::Int32 => array
-            .as_primitive::<Int32Type>()
+        DataType::Int32 => prim::<Int32Type>(array, column)?
             .iter()
             .map(|v| v.map(i128::from))
             .collect::<Vec<_>>(),
-        DataType::Int64 => array
-            .as_primitive::<Int64Type>()
+        DataType::Int64 => prim::<Int64Type>(array, column)?
             .iter()
             .map(|v| v.map(i128::from))
             .collect::<Vec<_>>(),
@@ -477,7 +486,7 @@ fn normalize_timestamp(
     let DataType::Int64 = array.data_type() else {
         return Err(physical_rejected(column, array.data_type()));
     };
-    let primitive = array.as_primitive::<Int64Type>();
+    let primitive = prim::<Int64Type>(array, column)?;
     let mut values = Vec::with_capacity(primitive.len());
     for index in 0..primitive.len() {
         if primitive.is_null(index) {

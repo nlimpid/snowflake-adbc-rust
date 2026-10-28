@@ -532,53 +532,16 @@ impl ColumnDecoder for TimestampDecoder {
     }
 
     fn finish(mut self: Box<Self>) -> Result<ArrayRef> {
-        let tz = self.tz.clone();
-        let apply = |array: ArrayRef| -> ArrayRef {
-            let Some(tz) = tz.clone() else {
-                return array;
-            };
-            match array.data_type() {
-                DataType::Timestamp(TimeUnit::Second, _) => Arc::new(
-                    array
-                        .as_any()
-                        .downcast_ref::<arrow_array::TimestampSecondArray>()
-                        .unwrap()
-                        .clone()
-                        .with_timezone(tz),
-                ),
-                DataType::Timestamp(TimeUnit::Millisecond, _) => Arc::new(
-                    array
-                        .as_any()
-                        .downcast_ref::<arrow_array::TimestampMillisecondArray>()
-                        .unwrap()
-                        .clone()
-                        .with_timezone(tz),
-                ),
-                DataType::Timestamp(TimeUnit::Microsecond, _) => Arc::new(
-                    array
-                        .as_any()
-                        .downcast_ref::<arrow_array::TimestampMicrosecondArray>()
-                        .unwrap()
-                        .clone()
-                        .with_timezone(tz),
-                ),
-                DataType::Timestamp(TimeUnit::Nanosecond, _) => Arc::new(
-                    array
-                        .as_any()
-                        .downcast_ref::<arrow_array::TimestampNanosecondArray>()
-                        .unwrap()
-                        .clone()
-                        .with_timezone(tz),
-                ),
-                _ => array,
-            }
-        };
-        let epoch: ArrayRef = apply(match self.unit {
+        let epoch: ArrayRef = match self.unit {
             TimeUnit::Second => Arc::new(self.seconds.finish()),
             TimeUnit::Millisecond => Arc::new(self.millis.finish()),
             TimeUnit::Microsecond => Arc::new(self.micros.finish()),
             TimeUnit::Nanosecond => Arc::new(self.nanos.finish()),
-        });
+        };
+        let epoch = match &self.tz {
+            Some(tz) => with_timezone(epoch, tz)?,
+            None => epoch,
+        };
         if self.with_offset && self.mode == TimestampTzMode::Struct {
             let offsets = self.offsets.finish();
             let nulls = NullBuffer::from(self.validity);
@@ -594,6 +557,56 @@ impl ColumnDecoder for TimestampDecoder {
         }
         Ok(epoch)
     }
+}
+
+fn with_timezone(array: ArrayRef, tz: &str) -> Result<ArrayRef> {
+    use arrow_array::Array;
+    let data_type = array.data_type().clone();
+    let mismatched = || {
+        Error::protocol(format!(
+            "timestamp array {data_type:?} could not be given timezone {tz}"
+        ))
+    };
+    let zoned: ArrayRef = match &data_type {
+        DataType::Timestamp(TimeUnit::Second, _) => {
+            let typed = array
+                .as_any()
+                .downcast_ref::<arrow_array::TimestampSecondArray>()
+                .ok_or_else(mismatched)?
+                .clone()
+                .with_timezone(tz);
+            Arc::new(typed)
+        }
+        DataType::Timestamp(TimeUnit::Millisecond, _) => {
+            let typed = array
+                .as_any()
+                .downcast_ref::<arrow_array::TimestampMillisecondArray>()
+                .ok_or_else(mismatched)?
+                .clone()
+                .with_timezone(tz);
+            Arc::new(typed)
+        }
+        DataType::Timestamp(TimeUnit::Microsecond, _) => {
+            let typed = array
+                .as_any()
+                .downcast_ref::<arrow_array::TimestampMicrosecondArray>()
+                .ok_or_else(mismatched)?
+                .clone()
+                .with_timezone(tz);
+            Arc::new(typed)
+        }
+        DataType::Timestamp(TimeUnit::Nanosecond, _) => {
+            let typed = array
+                .as_any()
+                .downcast_ref::<arrow_array::TimestampNanosecondArray>()
+                .ok_or_else(mismatched)?
+                .clone()
+                .with_timezone(tz);
+            Arc::new(typed)
+        }
+        _ => return Err(mismatched()),
+    };
+    Ok(zoned)
 }
 
 struct VectorDecoder {
@@ -883,5 +896,82 @@ mod tests {
         )
         .unwrap_err();
         assert!(matches!(err, Error::Decode { .. }), "{err}");
+    }
+
+    #[test]
+    fn every_timestamp_unit_keeps_its_timezone() {
+        use arrow_array::{
+            TimestampMicrosecondArray, TimestampMillisecondArray, TimestampNanosecondArray,
+            TimestampSecondArray,
+        };
+
+        let cases = [
+            (0, "1700000000", TimeUnit::Second, 1_700_000_000_i64),
+            (
+                3,
+                "1700000000.123",
+                TimeUnit::Millisecond,
+                1_700_000_000_123,
+            ),
+            (
+                6,
+                "1700000000.123456",
+                TimeUnit::Microsecond,
+                1_700_000_000_123_456,
+            ),
+            (
+                9,
+                "1700000000.123456789",
+                TimeUnit::Nanosecond,
+                1_700_000_000_123_456_789,
+            ),
+        ];
+        for (scale, raw, unit, expected) in cases {
+            for logical in ["timestamp_ltz", "timestamp_tz"] {
+                let text = if logical == "timestamp_tz" {
+                    format!("{raw} 1440")
+                } else {
+                    raw.to_string()
+                };
+                let batch = one(column("t", logical, None, Some(scale)), Some(&text)).unwrap();
+                assert_eq!(
+                    batch.schema().field(0).data_type(),
+                    &DataType::Timestamp(unit, Some(Arc::from("UTC"))),
+                    "{logical} scale {scale}"
+                );
+                let array = batch.column(0);
+                let value = match unit {
+                    TimeUnit::Second => array
+                        .as_any()
+                        .downcast_ref::<TimestampSecondArray>()
+                        .unwrap()
+                        .value(0),
+                    TimeUnit::Millisecond => array
+                        .as_any()
+                        .downcast_ref::<TimestampMillisecondArray>()
+                        .unwrap()
+                        .value(0),
+                    TimeUnit::Microsecond => array
+                        .as_any()
+                        .downcast_ref::<TimestampMicrosecondArray>()
+                        .unwrap()
+                        .value(0),
+                    TimeUnit::Nanosecond => array
+                        .as_any()
+                        .downcast_ref::<TimestampNanosecondArray>()
+                        .unwrap()
+                        .value(0),
+                };
+                assert_eq!(value, expected, "{logical} scale {scale}");
+            }
+        }
+    }
+
+    #[test]
+    fn timezone_on_non_timestamp_is_an_error() {
+        use arrow_array::Int64Array;
+        let array = Arc::new(Int64Array::from(vec![1_i64]));
+        let err = with_timezone(array, "UTC").unwrap_err();
+        assert!(err.to_string().contains("timezone"), "{err}");
     }
 }
