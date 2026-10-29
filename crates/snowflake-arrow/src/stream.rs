@@ -60,31 +60,27 @@ pub fn record_batches_with(
 /// Multi-thread runtime kept alive by every database, connection, statement,
 /// and batch reader that shares it.
 ///
-/// The last owner drops the runtime on a plain thread when the drop runs
-/// inside some other Tokio runtime. `Runtime`'s own drop panics in that case.
+/// The last owner calls `Runtime::shutdown_background` when the drop runs
+/// inside some other Tokio runtime. `Runtime`'s own drop panics in that case,
+/// and a detached thread would race unloading this crate from a process.
 pub struct SharedRuntime {
-    runtime: Option<tokio::runtime::Runtime>,
+    runtime: std::mem::ManuallyDrop<tokio::runtime::Runtime>,
 }
 
 impl SharedRuntime {
     pub fn new(runtime: tokio::runtime::Runtime) -> Self {
         Self {
-            runtime: Some(runtime),
+            runtime: std::mem::ManuallyDrop::new(runtime),
         }
-    }
-
-    fn get(&self) -> &tokio::runtime::Runtime {
-        self.runtime.as_ref().expect("runtime used after shutdown")
     }
 }
 
 impl Drop for SharedRuntime {
     fn drop(&mut self) {
-        let Some(runtime) = self.runtime.take() else {
-            return;
-        };
+        // Safety: `runtime` is initialized in `new` and this is the only take.
+        let runtime = unsafe { std::mem::ManuallyDrop::take(&mut self.runtime) };
         if tokio::runtime::Handle::try_current().is_ok() {
-            std::thread::spawn(move || drop(runtime));
+            runtime.shutdown_background();
         } else {
             drop(runtime);
         }
@@ -95,7 +91,7 @@ impl std::ops::Deref for SharedRuntime {
     type Target = tokio::runtime::Runtime;
 
     fn deref(&self) -> &Self::Target {
-        self.get()
+        &self.runtime
     }
 }
 
@@ -105,8 +101,10 @@ impl std::ops::Deref for SharedRuntime {
 /// closure onto the blocking pool; it does not drive a future on this runtime,
 /// and waiting for that task from a current-thread runtime panics too.
 /// Callers outside a runtime use `Runtime::block_on`. Callers already on this
-/// runtime use `block_in_place`. Callers on any other runtime, including
-/// current-thread, hop to a fresh thread that is allowed to `block_on`.
+/// runtime use `block_in_place`, which requires the multi-thread runtime built
+/// by the driver. Callers on any other runtime, including current-thread, hop
+/// to a fresh thread that is allowed to `block_on`. That thread is joined
+/// before return, so each foreign call pays a thread spawn.
 pub fn block_on_runtime<F, T>(runtime: &tokio::runtime::Runtime, future: F) -> T
 where
     F: std::future::Future<Output = T> + Send,

@@ -517,11 +517,18 @@ impl Statement for SnowflakeStatement {
 }
 
 fn build_runtime() -> Result<tokio::runtime::Runtime> {
-    tokio::runtime::Builder::new_multi_thread()
+    // Must stay multi-thread. `block_on_runtime` calls `block_in_place`, which
+    // panics on a current-thread runtime.
+    let runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .thread_name("snowflake-adbc")
         .build()
-        .map_err(runtime_build_error)
+        .map_err(runtime_build_error)?;
+    debug_assert_eq!(
+        runtime.handle().runtime_flavor(),
+        tokio::runtime::RuntimeFlavor::MultiThread
+    );
+    Ok(runtime)
 }
 
 fn runtime_build_error(err: std::io::Error) -> adbc_core::error::Error {
