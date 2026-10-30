@@ -57,22 +57,93 @@ pub fn record_batches_with(
     }
 }
 
+/// Multi-thread runtime kept alive by every database, connection, statement,
+/// and batch reader that shares it.
+///
+/// The last owner calls `Runtime::shutdown_background` when the drop runs
+/// inside some other Tokio runtime. `Runtime`'s own drop panics in that case,
+/// and a detached thread would race unloading this crate from a process.
+pub struct SharedRuntime {
+    runtime: std::mem::ManuallyDrop<tokio::runtime::Runtime>,
+}
+
+impl SharedRuntime {
+    pub fn new(runtime: tokio::runtime::Runtime) -> Self {
+        Self {
+            runtime: std::mem::ManuallyDrop::new(runtime),
+        }
+    }
+}
+
+impl Drop for SharedRuntime {
+    fn drop(&mut self) {
+        // Safety: `runtime` is initialized in `new` and this is the only take.
+        let runtime = unsafe { std::mem::ManuallyDrop::take(&mut self.runtime) };
+        if tokio::runtime::Handle::try_current().is_ok() {
+            runtime.shutdown_background();
+        } else {
+            drop(runtime);
+        }
+    }
+}
+
+impl std::ops::Deref for SharedRuntime {
+    type Target = tokio::runtime::Runtime;
+
+    fn deref(&self) -> &Self::Target {
+        &self.runtime
+    }
+}
+
+/// Drive `future` on `runtime` from a synchronous caller.
+///
+/// `Handle::block_on` panics inside any runtime. `spawn_blocking` only moves a
+/// closure onto the blocking pool; it does not drive a future on this runtime,
+/// and waiting for that task from a current-thread runtime panics too.
+/// Callers outside a runtime use `Runtime::block_on`. Callers already on this
+/// runtime use `block_in_place`, which requires the multi-thread runtime built
+/// by the driver. Callers on any other runtime, including current-thread, hop
+/// to a fresh thread that is allowed to `block_on`. That thread is joined
+/// before return, so each foreign call pays a thread spawn.
+pub fn block_on_runtime<F, T>(runtime: &tokio::runtime::Runtime, future: F) -> T
+where
+    F: std::future::Future<Output = T> + Send,
+    T: Send,
+{
+    match tokio::runtime::Handle::try_current() {
+        Err(_) => runtime.block_on(future),
+        Ok(current) if current.id() == runtime.handle().id() => {
+            tokio::task::block_in_place(|| current.block_on(future))
+        }
+        Ok(_) => std::thread::scope(|scope| {
+            let worker = scope.spawn(|| runtime.block_on(future));
+            match worker.join() {
+                Ok(value) => value,
+                Err(payload) => std::panic::resume_unwind(payload),
+            }
+        }),
+    }
+}
+
 /// Pulls an async batch stream from a multi-thread Tokio runtime. Used by ADBC.
+///
+/// Holds the runtime so the stream still runs after the database that created
+/// it is dropped.
 pub struct BlockingBatchReader {
     schema: SchemaRef,
-    handle: tokio::runtime::Handle,
+    runtime: Arc<SharedRuntime>,
     stream: Pin<Box<dyn Stream<Item = Result<RecordBatch>> + Send>>,
 }
 
 impl BlockingBatchReader {
     pub fn new(
-        handle: tokio::runtime::Handle,
+        runtime: Arc<SharedRuntime>,
         schema: SchemaRef,
         stream: Pin<Box<dyn Stream<Item = Result<RecordBatch>> + Send>>,
     ) -> Self {
         Self {
             schema,
-            handle,
+            runtime,
             stream,
         }
     }
@@ -82,8 +153,9 @@ impl Iterator for BlockingBatchReader {
     type Item = std::result::Result<RecordBatch, ArrowError>;
 
     fn next(&mut self) -> Option<Self::Item> {
+        let runtime = Arc::clone(&self.runtime);
         let next = self.stream.next();
-        match self.handle.block_on(next) {
+        match block_on_runtime(&runtime, next) {
             None => None,
             Some(Ok(batch)) => Some(Ok(batch)),
             Some(Err(err)) => Some(Err(ArrowError::ExternalError(Box::new(err)))),
