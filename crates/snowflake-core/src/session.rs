@@ -12,10 +12,11 @@ use serde_json::{json, Value};
 use tokio::sync::{Mutex, Notify};
 use url::Url;
 
+use crate::auth::normalize_jwt_account;
 use crate::bind::{self, Bind};
 use crate::config::{ClientConfig, GOSNOWFLAKE_APP_ID, GOSNOWFLAKE_COMPAT_VERSION};
 use crate::error::{self, Error, Result};
-use crate::protocol::{self, LoginData, QueryData, RenewData, SessionParameters};
+use crate::protocol::{self, LoginData, QueryData, RenewData, SessionInfo, SessionParameters};
 use crate::result::{QueryResult, ResultFormat};
 use crate::transport::{self, JsonRequest, TokenKind};
 
@@ -40,7 +41,10 @@ struct SessionState {
 
 #[derive(Clone)]
 struct Inflight {
-    request_id: String,
+    /// Client `requestId` for a query this session submitted.
+    request_id: Option<String>,
+    /// Server query id, for `fetch_result` and for abort once it is known.
+    query_id: Option<String>,
     sql: String,
 }
 
@@ -55,6 +59,8 @@ struct Inner {
     query_context: Mutex<Value>,
     renew_lock: Mutex<()>,
     inflight: std::sync::Mutex<Option<Inflight>>,
+    /// `Statement::cancel` arrived before `execute` recorded this request id.
+    pending_cancel: std::sync::Mutex<Option<String>>,
     cancel_generation: AtomicU64,
     cancel_notify: Notify,
     heartbeat: std::sync::Mutex<Option<tokio::task::JoinHandle<()>>>,
@@ -79,12 +85,8 @@ impl Session {
     pub(crate) async fn login(http: reqwest::Client, config: ClientConfig) -> Result<Self> {
         let base_url = config.base_url()?;
         let user_agent = config.user_agent();
-        let body = login_body(&config)?;
-        let mut query = Vec::new();
-        push_opt(&mut query, "databaseName", config.database.as_deref());
-        push_opt(&mut query, "schemaName", config.schema.as_deref());
-        push_opt(&mut query, "warehouse", config.warehouse.as_deref());
-        push_opt(&mut query, "roleName", config.role.as_deref());
+        let config_for_login = config.clone();
+        let query = context_query(&config, None);
         let envelope = transport::send_json(
             &http,
             &base_url,
@@ -92,12 +94,13 @@ impl Session {
                 method: Method::POST,
                 path: "session/v1/login-request",
                 query,
-                body: Some(body),
+                body: None,
                 token: TokenKind::None,
                 user_agent: &user_agent,
                 attempt_timeout: config.login_timeout.unwrap_or(Duration::from_secs(60)),
                 retry_budget: config.retry_timeout,
                 request_id: None,
+                body_factory: Some(Box::new(move || login_body(&config_for_login))),
             },
         )
         .await?;
@@ -108,7 +111,20 @@ impl Session {
             .map_err(|err| Error::protocol(format!("login response: {err}")))?;
         let mut parameters = SessionParameters::default();
         parameters.extend_from_response(&data.parameters);
-        let keep_alive = config.keep_alive || parameters.flag("CLIENT_SESSION_KEEP_ALIVE");
+        let mut state = SessionState {
+            server_version: data.server_version.clone().unwrap_or_default(),
+            session_id: data.session_id,
+            database: None,
+            schema: None,
+            warehouse: None,
+            role: None,
+            parameters,
+            closed: false,
+        };
+        if let Some(info) = &data.session_info {
+            apply_session_info(&mut state, info);
+        }
+        let keep_alive = config.keep_alive || state.parameters.flag("CLIENT_SESSION_KEEP_ALIVE");
         let session = Self {
             inner: Arc::new(Inner {
                 http,
@@ -119,20 +135,12 @@ impl Session {
                     session_token: data.token,
                     master_token: data.master_token,
                 }),
-                state: RwLock::new(SessionState {
-                    server_version: data.server_version.unwrap_or_default(),
-                    session_id: data.session_id,
-                    database: None,
-                    schema: None,
-                    warehouse: None,
-                    role: None,
-                    parameters,
-                    closed: false,
-                }),
+                state: RwLock::new(state),
                 sequence: AtomicU64::new(1),
                 query_context: Mutex::new(json!({ "entries": [] })),
                 renew_lock: Mutex::new(()),
                 inflight: std::sync::Mutex::new(None),
+                pending_cancel: std::sync::Mutex::new(None),
                 cancel_generation: AtomicU64::new(0),
                 cancel_notify: Notify::new(),
                 heartbeat: std::sync::Mutex::new(None),
@@ -154,6 +162,8 @@ impl Session {
             describe_only: false,
             async_exec: false,
             parameters: HashMap::new(),
+            request_id: None,
+            prefetch: None,
         }
     }
 
@@ -210,8 +220,14 @@ impl Session {
         self.ensure_open()?;
         let path = format!("queries/{query_id}/result");
         let generation = self.inner.cancel_generation.load(Ordering::SeqCst);
-        self.set_inflight(query_id, "");
-        let result = self.poll_until_complete(&path, None, generation).await;
+        // The original client request id is not known here. Abort must use queryId.
+        self.set_inflight(None, Some(query_id.to_string()), "");
+        let result = self
+            .poll_until_complete(&path, None, generation, None)
+            .await;
+        if matches!(result, Err(Error::Timeout)) {
+            self.abort_after_timeout().await;
+        }
         self.clear_inflight();
         result
     }
@@ -220,6 +236,30 @@ impl Session {
         self.inner.cancel_generation.fetch_add(1, Ordering::SeqCst);
         self.inner.cancel_notify.notify_waiters();
         self.abort_inflight().await
+    }
+
+    /// Abort the in-flight query submitted with `request_id`.
+    ///
+    /// An idle statement must not call [`Session::cancel`]: that bumps the
+    /// session generation and cancels every query on the connection.
+    pub async fn cancel_request(&self, request_id: &str) -> Result<()> {
+        if self.inflight_request_is(request_id) {
+            return self.cancel().await;
+        }
+        *self
+            .inner
+            .pending_cancel
+            .lock()
+            .unwrap_or_else(|err| err.into_inner()) = Some(request_id.to_string());
+        if self.inflight_request_is(request_id) {
+            *self
+                .inner
+                .pending_cancel
+                .lock()
+                .unwrap_or_else(|err| err.into_inner()) = None;
+            return self.cancel().await;
+        }
+        Ok(())
     }
 
     pub async fn close(&self) -> Result<()> {
@@ -257,9 +297,22 @@ impl Session {
     async fn execute(&self, query: QueryParts) -> Result<QueryResult> {
         self.ensure_open()?;
         let generation = self.inner.cancel_generation.load(Ordering::SeqCst);
-        let request_id = uuid::Uuid::new_v4().to_string();
-        self.set_inflight(&request_id, &query.sql);
+        let request_id = query
+            .request_id
+            .clone()
+            .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
+        if self.take_pending_cancel(&request_id) {
+            return Err(Error::Cancelled);
+        }
+        self.set_inflight(Some(request_id.clone()), None, &query.sql);
+        if self.take_pending_cancel(&request_id) {
+            self.clear_inflight();
+            return Err(Error::Cancelled);
+        }
         let result = self.execute_inner(query, &request_id, generation).await;
+        if matches!(result, Err(Error::Timeout)) {
+            self.abort_after_timeout().await;
+        }
         self.clear_inflight();
         result
     }
@@ -304,8 +357,14 @@ impl Session {
                 deadline,
             )
             .await?;
-        self.finish_query(envelope, query.async_exec, generation, deadline)
-            .await
+        self.finish_query(
+            envelope,
+            query.async_exec,
+            generation,
+            deadline,
+            query.prefetch,
+        )
+        .await
     }
 
     async fn finish_query(
@@ -314,9 +373,10 @@ impl Session {
         async_exec: bool,
         generation: u64,
         deadline: Option<Instant>,
+        prefetch: Option<usize>,
     ) -> Result<QueryResult> {
         if envelope.success {
-            return self.result_from_data(envelope.data()?, false);
+            return self.result_from_data(envelope.data()?, false, prefetch);
         }
         let code = envelope.code.clone().unwrap_or_default();
         if Error::is_query_in_progress(&code) {
@@ -331,9 +391,12 @@ impl Session {
                 .and_then(|d| d.get("queryId"))
                 .and_then(Value::as_str)
                 .map(str::to_string);
+            if let Some(query_id) = query_id.as_deref() {
+                self.note_query_id(query_id);
+            }
             if async_exec {
                 if let Some(data) = data.as_ref() {
-                    let mut result = self.result_from_data(data, true)?;
+                    let mut result = self.result_from_data(data, true, prefetch)?;
                     if let Some(query_id) = query_id {
                         result.set_query_id_if_empty(query_id);
                     }
@@ -348,7 +411,9 @@ impl Session {
                     query_id.ok_or_else(|| Error::protocol("running query has no id"))?
                 ),
             };
-            return self.poll_until_complete(&path, deadline, generation).await;
+            return self
+                .poll_until_complete(&path, deadline, generation, prefetch)
+                .await;
         }
         Err(error_from_envelope(&envelope))
     }
@@ -358,6 +423,7 @@ impl Session {
         path: &str,
         deadline: Option<Instant>,
         generation: u64,
+        prefetch: Option<usize>,
     ) -> Result<QueryResult> {
         let mut delay = POLL_INITIAL;
         loop {
@@ -374,7 +440,7 @@ impl Session {
                 )
                 .await?;
             if envelope.success {
-                return self.result_from_data(envelope.data()?, false);
+                return self.result_from_data(envelope.data()?, false, prefetch);
             }
             let code = envelope.code.clone().unwrap_or_default();
             if !Error::is_query_in_progress(&code) {
@@ -385,7 +451,12 @@ impl Session {
         }
     }
 
-    fn result_from_data(&self, data: &Value, pending: bool) -> Result<QueryResult> {
+    fn result_from_data(
+        &self,
+        data: &Value,
+        pending: bool,
+        prefetch: Option<usize>,
+    ) -> Result<QueryResult> {
         let parsed = QueryData::from_value(data)?;
         {
             let mut state = write_lock(&self.inner.state);
@@ -437,15 +508,7 @@ impl Session {
             None
         };
         let parameters = self.parameters();
-        let mut headers: Vec<(String, String)> = parsed.chunk_headers.into_iter().collect();
-        let has_sse = headers
-            .iter()
-            .any(|(key, _)| key.eq_ignore_ascii_case("x-amz-server-side-encryption-customer-key"));
-        if !has_sse {
-            if let Some(qrmk) = parsed.qrmk {
-                headers.push(("x-amz-server-side-encryption-customer-key".into(), qrmk));
-            }
-        }
+        let headers = chunk_request_headers(parsed.chunk_headers, parsed.qrmk);
         Ok(QueryResult::new(
             parsed.query_id.unwrap_or_default(),
             format,
@@ -463,7 +526,9 @@ impl Session {
             parsed.chunks,
             self.inner.http.clone(),
             headers,
-            self.inner.config.prefetch_concurrency,
+            prefetch
+                .unwrap_or(self.inner.config.prefetch_concurrency)
+                .max(1),
             self.inner.user_agent.clone(),
         ))
     }
@@ -511,6 +576,7 @@ impl Session {
                     attempt_timeout,
                     retry_budget: retry_budget(&self.inner.config, deadline)?,
                     request_id: request_id.map(str::to_string),
+                    body_factory: None,
                 },
             );
             let envelope = tokio::select! {
@@ -578,6 +644,7 @@ impl Session {
                 attempt_timeout: Duration::from_secs(60),
                 retry_budget: self.inner.config.retry_timeout,
                 request_id: None,
+                body_factory: None,
             },
         )
         .await?;
@@ -599,15 +666,19 @@ impl Session {
     }
 
     async fn login_locked(&self) -> Result<()> {
-        let body = login_body(&self.inner.config)?;
+        let query = {
+            let state = read_lock(&self.inner.state);
+            context_query(&self.inner.config, Some(&state))
+        };
+        let config = self.inner.config.clone();
         let envelope = transport::send_json(
             &self.inner.http,
             &self.inner.base_url,
             JsonRequest {
                 method: Method::POST,
                 path: "session/v1/login-request",
-                query: Vec::new(),
-                body: Some(body),
+                query,
+                body: None,
                 token: TokenKind::None,
                 user_agent: &self.inner.user_agent,
                 attempt_timeout: self
@@ -617,15 +688,14 @@ impl Session {
                     .unwrap_or(Duration::from_secs(60)),
                 retry_budget: self.inner.config.retry_timeout,
                 request_id: None,
+                body_factory: Some(Box::new(move || login_body(&config))),
             },
         )
         .await?;
         if !envelope.success {
-            let err = error_from_envelope(&envelope);
-            if matches!(err, Error::Auth { .. }) {
-                return Err(Error::SessionExpired);
-            }
-            return Err(err);
+            // A rotated password or rejected key is an auth failure. Calling it
+            // "session expired" hides the reason the new login did not succeed.
+            return Err(error_from_envelope(&envelope));
         }
         let data: LoginData = serde_json::from_value(envelope.data()?.clone())
             .map_err(|err| Error::protocol(format!("relogin response: {err}")))?;
@@ -634,9 +704,19 @@ impl Session {
             tokens.session_token = data.token;
             tokens.master_token = data.master_token;
         }
-        write_lock(&self.inner.state)
-            .parameters
-            .extend_from_response(&data.parameters);
+        {
+            let mut state = write_lock(&self.inner.state);
+            state.parameters.extend_from_response(&data.parameters);
+            if let Some(info) = &data.session_info {
+                apply_session_info(&mut state, info);
+            }
+            if let Some(session_id) = data.session_id {
+                state.session_id = Some(session_id);
+            }
+            if let Some(version) = data.server_version.clone().filter(|s| !s.is_empty()) {
+                state.server_version = version;
+            }
+        }
         Ok(())
     }
 
@@ -651,10 +731,15 @@ impl Session {
         let Some(inflight) = inflight else {
             return Ok(());
         };
-        let body = json!({
-            "sqlText": inflight.sql,
-            "requestId": inflight.request_id,
-        });
+        let mut body = serde_json::Map::new();
+        body.insert("sqlText".into(), json!(inflight.sql));
+        if let Some(request_id) = inflight.request_id {
+            body.insert("requestId".into(), json!(request_id));
+        }
+        if let Some(query_id) = inflight.query_id {
+            body.insert("queryId".into(), json!(query_id));
+        }
+        let body = Value::Object(body);
         let _ = self
             .authed(
                 Method::POST,
@@ -669,16 +754,19 @@ impl Session {
 
     fn spawn_heartbeat(&self) {
         let interval = heartbeat_interval(&read_lock(&self.inner.state).parameters);
-        let inner = Arc::clone(&self.inner);
+        // Weak, so dropping the last Session drops Inner and aborts this task.
+        // An Arc here would keep the server session alive after the user drops it.
+        let weak = Arc::downgrade(&self.inner);
         let handle = tokio::spawn(async move {
             loop {
                 tokio::time::sleep(interval).await;
+                let Some(inner) = weak.upgrade() else {
+                    break;
+                };
                 if inner.closed.load(Ordering::SeqCst) {
                     break;
                 }
-                let session = Session {
-                    inner: Arc::clone(&inner),
-                };
+                let session = Session { inner };
                 if session
                     .authed(
                         Method::POST,
@@ -701,15 +789,59 @@ impl Session {
             .unwrap_or_else(|err| err.into_inner()) = Some(handle);
     }
 
-    fn set_inflight(&self, request_id: &str, sql: &str) {
+    fn set_inflight(&self, request_id: Option<String>, query_id: Option<String>, sql: &str) {
         *self
             .inner
             .inflight
             .lock()
             .unwrap_or_else(|err| err.into_inner()) = Some(Inflight {
-            request_id: request_id.to_string(),
+            request_id,
+            query_id,
             sql: sql.to_string(),
         });
+    }
+
+    fn note_query_id(&self, query_id: &str) {
+        if query_id.is_empty() {
+            return;
+        }
+        let mut inflight = self
+            .inner
+            .inflight
+            .lock()
+            .unwrap_or_else(|err| err.into_inner());
+        if let Some(inflight) = inflight.as_mut() {
+            inflight.query_id = Some(query_id.to_string());
+        }
+    }
+
+    fn inflight_request_is(&self, request_id: &str) -> bool {
+        self.inner
+            .inflight
+            .lock()
+            .unwrap_or_else(|err| err.into_inner())
+            .as_ref()
+            .is_some_and(|item| item.request_id.as_deref() == Some(request_id))
+    }
+
+    fn take_pending_cancel(&self, request_id: &str) -> bool {
+        let mut pending = self
+            .inner
+            .pending_cancel
+            .lock()
+            .unwrap_or_else(|err| err.into_inner());
+        if pending.as_deref() == Some(request_id) {
+            *pending = None;
+            true
+        } else {
+            false
+        }
+    }
+
+    async fn abort_after_timeout(&self) {
+        if self.abort_inflight().await.is_err() {
+            tracing::debug!("abort after query timeout failed");
+        }
     }
 
     fn clear_inflight(&self) {
@@ -738,7 +870,11 @@ impl Session {
 
     async fn wait_cancel(&self, generation: u64) {
         loop {
+            // Register the waiter before reading the generation. Otherwise a
+            // cancel between the load and the first poll of `notified` is lost.
             let notified = self.inner.cancel_notify.notified();
+            tokio::pin!(notified);
+            notified.as_mut().enable();
             if self.inner.cancel_generation.load(Ordering::SeqCst) != generation {
                 return;
             }
@@ -751,6 +887,72 @@ impl Session {
             _ = tokio::time::sleep(delay) => self.ensure_generation(generation),
             _ = self.wait_cancel(generation) => Err(Error::Cancelled),
         }
+    }
+
+    #[cfg(test)]
+    fn idle_for_test(keep_alive: bool) -> Self {
+        let config = test_client_config();
+        let base_url = config.base_url().expect("base url");
+        let user_agent = config.user_agent();
+        let session = Self {
+            inner: Arc::new(Inner {
+                http: reqwest::Client::new(),
+                base_url,
+                user_agent,
+                config,
+                tokens: RwLock::new(Tokens {
+                    session_token: "session".into(),
+                    master_token: "master".into(),
+                }),
+                state: RwLock::new(SessionState {
+                    server_version: String::new(),
+                    session_id: None,
+                    database: None,
+                    schema: None,
+                    warehouse: None,
+                    role: None,
+                    parameters: SessionParameters::default(),
+                    closed: false,
+                }),
+                sequence: AtomicU64::new(1),
+                query_context: Mutex::new(json!({ "entries": [] })),
+                renew_lock: Mutex::new(()),
+                inflight: std::sync::Mutex::new(None),
+                pending_cancel: std::sync::Mutex::new(None),
+                cancel_generation: AtomicU64::new(0),
+                cancel_notify: Notify::new(),
+                heartbeat: std::sync::Mutex::new(None),
+                closed: AtomicBool::new(false),
+            }),
+        };
+        if keep_alive {
+            session.spawn_heartbeat();
+        }
+        session
+    }
+}
+
+#[cfg(test)]
+fn test_client_config() -> ClientConfig {
+    ClientConfig {
+        account: "xy12345.us-east-1.aws".into(),
+        user: "svc".into(),
+        authenticator: crate::auth::Authenticator::password("pw"),
+        warehouse: Some("WH".into()),
+        database: Some("DB".into()),
+        schema: Some("PUBLIC".into()),
+        role: Some("R".into()),
+        host: None,
+        port: None,
+        protocol: "https".into(),
+        app_name: crate::config::DEFAULT_APP_NAME.into(),
+        prefetch_concurrency: 4,
+        query_timeout: None,
+        login_timeout: Some(Duration::from_secs(60)),
+        retry_timeout: crate::config::DEFAULT_RETRY_TIMEOUT,
+        http_attempt_timeout: Duration::from_secs(120),
+        session_parameters: HashMap::new(),
+        keep_alive: false,
     }
 }
 
@@ -782,7 +984,11 @@ fn login_body(config: &ClientConfig) -> Result<Value> {
         "CLIENT_APP_VERSION".into(),
         json!(GOSNOWFLAKE_COMPAT_VERSION),
     );
-    data.insert("ACCOUNT_NAME".into(), json!(config.account));
+    let account_name = normalize_jwt_account(&config.account);
+    if account_name.is_empty() {
+        return Err(Error::protocol("account name is empty"));
+    }
+    data.insert("ACCOUNT_NAME".into(), json!(account_name));
     data.insert("LOGIN_NAME".into(), json!(config.user));
     data.insert("AUTHENTICATOR".into(), json!(material.authenticator));
     if let Some(password) = material.password {
@@ -892,12 +1098,95 @@ fn attempt_timeout(config: &ClientConfig, deadline: Option<Instant>) -> Result<D
     Ok(timeout.max(Duration::from_millis(1)))
 }
 
-fn push_opt(query: &mut Vec<(&str, String)>, key: &'static str, value: Option<&str>) {
-    if let Some(value) = value {
-        if !value.is_empty() {
-            query.push((key, value.to_string()));
-        }
+fn context_query(
+    config: &ClientConfig,
+    state: Option<&SessionState>,
+) -> Vec<(&'static str, String)> {
+    let mut query = Vec::new();
+    push_owned(
+        &mut query,
+        "databaseName",
+        prefer(
+            state.and_then(|state| state.database.as_deref()),
+            config.database.as_deref(),
+        ),
+    );
+    push_owned(
+        &mut query,
+        "schemaName",
+        prefer(
+            state.and_then(|state| state.schema.as_deref()),
+            config.schema.as_deref(),
+        ),
+    );
+    push_owned(
+        &mut query,
+        "warehouse",
+        prefer(
+            state.and_then(|state| state.warehouse.as_deref()),
+            config.warehouse.as_deref(),
+        ),
+    );
+    push_owned(
+        &mut query,
+        "roleName",
+        prefer(
+            state.and_then(|state| state.role.as_deref()),
+            config.role.as_deref(),
+        ),
+    );
+    query
+}
+
+fn prefer(primary: Option<&str>, fallback: Option<&str>) -> Option<String> {
+    if let Some(value) = nonempty(primary) {
+        return Some(value.to_string());
     }
+    nonempty(fallback).map(str::to_string)
+}
+
+fn push_owned(query: &mut Vec<(&'static str, String)>, key: &'static str, value: Option<String>) {
+    if let Some(value) = value.filter(|value| !value.is_empty()) {
+        query.push((key, value));
+    }
+}
+
+fn nonempty(value: Option<&str>) -> Option<&str> {
+    value.filter(|value| !value.is_empty())
+}
+
+fn apply_session_info(state: &mut SessionState, info: &SessionInfo) {
+    let assign = |slot: &mut Option<String>, value: &Option<String>| {
+        if let Some(value) = nonempty(value.as_deref()) {
+            *slot = Some(value.to_string());
+        }
+    };
+    assign(&mut state.database, &info.database_name);
+    assign(&mut state.schema, &info.schema_name);
+    assign(&mut state.warehouse, &info.warehouse_name);
+    assign(&mut state.role, &info.role_name);
+}
+
+/// Headers for a chunk download.
+///
+/// When Snowflake omits `chunkHeaders`, the Go driver sends the SSE-C
+/// algorithm and the customer key. S3 rejects the key without `AES256`.
+fn chunk_request_headers(
+    chunk_headers: HashMap<String, String>,
+    qrmk: Option<String>,
+) -> Vec<(String, String)> {
+    if !chunk_headers.is_empty() {
+        return chunk_headers.into_iter().collect();
+    }
+    let mut headers = Vec::new();
+    if let Some(qrmk) = qrmk.filter(|value| !value.is_empty()) {
+        headers.push((
+            "x-amz-server-side-encryption-customer-algorithm".into(),
+            "AES256".into(),
+        ));
+        headers.push(("x-amz-server-side-encryption-customer-key".into(), qrmk));
+    }
+    headers
 }
 
 fn read_lock<T>(lock: &RwLock<T>) -> std::sync::RwLockReadGuard<'_, T> {
@@ -914,6 +1203,8 @@ struct QueryParts {
     describe_only: bool,
     async_exec: bool,
     parameters: HashMap<String, String>,
+    request_id: Option<String>,
+    prefetch: Option<usize>,
 }
 
 /// A statement built on a [`Session`].
@@ -924,6 +1215,8 @@ pub struct Query<'a> {
     describe_only: bool,
     async_exec: bool,
     parameters: HashMap<String, String>,
+    request_id: Option<String>,
+    prefetch: Option<usize>,
 }
 
 impl<'a> Query<'a> {
@@ -952,6 +1245,18 @@ impl<'a> Query<'a> {
         self
     }
 
+    /// Use this id for the query-request and for [`Session::cancel_request`].
+    pub fn request_id(mut self, request_id: impl Into<String>) -> Self {
+        self.request_id = Some(request_id.into());
+        self
+    }
+
+    /// Chunk-download concurrency for this statement. Falls back to the session default.
+    pub fn prefetch(mut self, threads: usize) -> Self {
+        self.prefetch = Some(threads.max(1));
+        self
+    }
+
     pub async fn execute(self) -> Result<QueryResult> {
         self.session
             .execute(QueryParts {
@@ -960,6 +1265,8 @@ impl<'a> Query<'a> {
                 describe_only: self.describe_only,
                 async_exec: self.async_exec,
                 parameters: self.parameters,
+                request_id: self.request_id,
+                prefetch: self.prefetch,
             })
             .await
     }
@@ -994,12 +1301,113 @@ impl QueryStatus {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use std::collections::HashMap;
+    use std::sync::atomic::Ordering;
+
+    use super::{
+        apply_session_info, chunk_request_headers, context_query, login_body, test_client_config,
+        QueryStatus, Session, SessionInfo, SessionParameters, SessionState,
+    };
 
     #[test]
     fn query_status_parse() {
         assert_eq!(QueryStatus::parse("SUCCESS"), QueryStatus::Success);
         assert_eq!(QueryStatus::parse("RUNNING"), QueryStatus::Running);
         assert_eq!(QueryStatus::parse("ABORTED"), QueryStatus::Aborted);
+    }
+
+    #[test]
+    fn login_account_name_strips_region_and_host() {
+        let mut config = test_client_config();
+        let body = login_body(&config).unwrap();
+        assert_eq!(body["data"]["ACCOUNT_NAME"], "XY12345");
+
+        config.account = "myorg-myacct.snowflakecomputing.com".into();
+        let body = login_body(&config).unwrap();
+        assert_eq!(body["data"]["ACCOUNT_NAME"], "MYORG-MYACCT");
+    }
+
+    #[test]
+    fn relogin_query_keeps_session_context() {
+        let config = test_client_config();
+        let fresh = context_query(&config, None);
+        assert_eq!(query_value(&fresh, "databaseName"), Some("DB"));
+        assert_eq!(query_value(&fresh, "schemaName"), Some("PUBLIC"));
+        assert_eq!(query_value(&fresh, "warehouse"), Some("WH"));
+        assert_eq!(query_value(&fresh, "roleName"), Some("R"));
+
+        let mut state = SessionState {
+            server_version: String::new(),
+            session_id: None,
+            database: Some("OTHER".into()),
+            schema: Some("NEW".into()),
+            warehouse: None,
+            role: Some(String::new()),
+            parameters: SessionParameters::default(),
+            closed: false,
+        };
+        let relogin = context_query(&config, Some(&state));
+        assert_eq!(query_value(&relogin, "databaseName"), Some("OTHER"));
+        assert_eq!(query_value(&relogin, "schemaName"), Some("NEW"));
+        assert_eq!(query_value(&relogin, "warehouse"), Some("WH"));
+        assert_eq!(query_value(&relogin, "roleName"), Some("R"));
+
+        apply_session_info(
+            &mut state,
+            &SessionInfo {
+                database_name: Some("FROM_LOGIN".into()),
+                schema_name: None,
+                warehouse_name: Some("WH2".into()),
+                role_name: Some("SYSADMIN".into()),
+            },
+        );
+        assert_eq!(state.database.as_deref(), Some("FROM_LOGIN"));
+        assert_eq!(state.schema.as_deref(), Some("NEW"));
+        assert_eq!(state.warehouse.as_deref(), Some("WH2"));
+        assert_eq!(state.role.as_deref(), Some("SYSADMIN"));
+    }
+
+    #[test]
+    fn missing_chunk_headers_include_sse_c_algorithm() {
+        let headers = chunk_request_headers(HashMap::new(), Some("qrmk".into()));
+        assert!(headers.iter().any(|(key, value)| {
+            key == "x-amz-server-side-encryption-customer-algorithm" && value == "AES256"
+        }));
+        assert!(headers.iter().any(|(key, value)| key
+            == "x-amz-server-side-encryption-customer-key"
+            && value == "qrmk"));
+        let mut provided = HashMap::new();
+        provided.insert("x-ms-blob-type".into(), "BlockBlob".into());
+        let headers = chunk_request_headers(provided, Some("qrmk".into()));
+        assert_eq!(headers.len(), 1);
+        assert_eq!(headers[0].0, "x-ms-blob-type");
+    }
+
+    #[tokio::test]
+    async fn dropping_keep_alive_session_drops_inner() {
+        let session = Session::idle_for_test(true);
+        let weak = std::sync::Arc::downgrade(&session.inner);
+        drop(session);
+        assert!(weak.upgrade().is_none());
+    }
+
+    #[tokio::test]
+    async fn cancel_request_does_not_bump_generation_for_another_statement() {
+        let session = Session::idle_for_test(false);
+        session.set_inflight(Some("mine".into()), None, "select 1");
+        let before = session.inner.cancel_generation.load(Ordering::SeqCst);
+        session.cancel_request("other").await.unwrap();
+        assert_eq!(
+            session.inner.cancel_generation.load(Ordering::SeqCst),
+            before
+        );
+        assert!(session.take_pending_cancel("other"));
+    }
+
+    fn query_value<'a>(query: &'a [(&str, String)], key: &str) -> Option<&'a str> {
+        query
+            .iter()
+            .find(|(name, _)| *name == key)
+            .map(|(_, value)| value.as_str())
     }
 }

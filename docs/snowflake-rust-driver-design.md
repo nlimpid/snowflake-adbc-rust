@@ -102,7 +102,7 @@ Base URL：`https://{host}` ，`host` 默认由 `account` 推导：`{account}.sn
 | 续期 | `POST /session/token-request`，Header 用 `masterToken`，Body `{"oldSessionToken": ..., "requestType": "RENEW"}` | 收到错误码 `390112`（session token 过期）时触发，然后重放原请求 |
 | 执行 | `POST /queries/v1/query-request` | 见 3.3 |
 | 轮询结果 | `GET /queries/{queryId}/result` 或响应中的 `data.getResultUrl` | 执行返回 `333333` / `333334`（查询仍在运行）时轮询 |
-| 取消 | `POST /queries/v1/abort-request`，Body `{"sqlText": ..., "requestId": 原请求的 requestId}` | |
+| 取消 | `POST /queries/v1/abort-request`，Body 带 `sqlText`，以及原来的 `requestId` 和/或 `queryId` | |
 | 心跳 | `POST /session/heartbeat` | 开启 `CLIENT_SESSION_KEEP_ALIVE` 时按 `CLIENT_SESSION_KEEP_ALIVE_HEARTBEAT_FREQUENCY` 发送 |
 | 关闭 | `POST /session?delete=true` | |
 
@@ -169,7 +169,15 @@ struct Session {
 }
 ```
 
-续期策略：请求返回 `390112` → 用 master token 调 `/session/token-request` → 更新 session token → 重放原请求一次。续期本身失败（master token 也过期，`390114`）→ 如果持有凭据则重新登录一次，否则向上抛 `Error::SessionExpired`。用一个 `Mutex` 串行化续期，避免并发请求同时触发多次续期。
+续期策略：请求返回 `390112` → 用 master token 调 `/session/token-request` → 更新 session token → 重放原请求一次。续期本身失败（master token 也过期，`390114`）→ 如果持有凭据则重新登录一次。重新登录带上当前会话的 database / schema / warehouse / role（会话里还没有就用客户端配置），并解析响应里的 `sessionInfo`。密码被轮换或密钥被拒绝时返回 `Error::Auth`，不改写成 `SessionExpired`。用一个 `Mutex` 串行化续期，避免并发请求同时触发多次续期。
+
+登录请求在每次 HTTP 尝试前重新组 body。Key-pair JWT 的 `exp` 只有 60 秒，重试预算默认 300 秒；复用同一个 token 会在超过一分钟后收到 `390144`。
+
+`ACCOUNT_NAME` 与 JWT 的 account 使用同一套归一化：去掉 region、cloud 和 `snowflakecomputing.com` / `.cn` 后缀，再转成大写。
+
+心跳任务只持有 `Weak`。调用方 drop `Session` 而没有 `close()` 时，`Inner` 可以析构并停掉心跳，服务端会话不再被续活。
+
+`query_timeout` 到期时先发 `abort-request`，再返回 `Error::Timeout`。`fetch_result` 登记的是 query id，取消时 body 带 `queryId`，不把它当成原来的 `requestId`。`Connection::cancel` 仍取消该连接上所有 in-flight 查询；`Statement::cancel` 只取消自己的 request id，空闲语句不增加 session generation。
 
 ### 3.3 查询执行
 
@@ -199,7 +207,7 @@ struct Session {
 | `rowset` | JSON 格式时的首批数据（二维数组，元素是字符串或 null） |
 | `rowsetBase64` | Arrow 格式时的首批数据，base64 编码的 Arrow IPC stream；0 行时可能是空字符串 |
 | `chunks[]` | 剩余分片：`url`, `rowCount`, `uncompressedSize`, `compressedSize` |
-| `chunkHeaders` / `qrmk` | 下载分片要带的 header（S3 SSE-C 密钥）；没有 `chunkHeaders` 时用 `x-amz-server-side-encryption-customer-key: {qrmk}` |
+| `chunkHeaders` / `qrmk` | 下载分片要带的 header。没有 `chunkHeaders` 时补 `x-amz-server-side-encryption-customer-algorithm: AES256` 和 `x-amz-server-side-encryption-customer-key: {qrmk}` |
 | `total` / `returned` | 总行数 / 首批行数 |
 | `parameters[]` | 会话参数更新（如 `TIMEZONE` 被 `ALTER SESSION` 改了） |
 | `statementTypeId` | 判断是 DML / DDL / SELECT，用于 ADBC `execute_update` 的受影响行数 |
@@ -256,7 +264,7 @@ ADBC 的 `bind(RecordBatch)` 对应：每一行一次执行（P0），或在 `ar
 | 连接失败 / 超时 / HTTP 5xx / 429 / 408 | 指数退避重试（1s 起，上限 16s，总时长上限可配置，默认 300s），同一个 `requestId` |
 | HTTP 4xx（非 429/408） | 不重试，`Error::Http` |
 | `success = false`，`code = 390112` | 续期后重放一次 |
-| `success = false`，`code = 390114` / `390115` | 重新登录（有凭据）或 `Error::SessionExpired` |
+| `success = false`，`code = 390114` / `390115` | 重新登录（有凭据）。重新登录本身认证失败则 `Error::Auth`，不是 `SessionExpired` |
 | `success = false`，`code = 333333/333334` | 进入轮询 |
 | `success = false`，其他 | `Error::Server { code, message, sql_state, query_id }`，不重试 |
 | 结果解码失败 | `Error::Decode { column, row, logical_type, raw, reason }`，不重试，不降级 |
@@ -396,13 +404,13 @@ Snowflake 返回的 IPC stream 里，字段 metadata 含 `logicalType`、`scale`
 
 ### 5.1 选项键
 
-兼容官方 Go ADBC Snowflake 驱动的键名，这样现有用 Go 驱动的 ADBC 调用方（Python `adbc_driver_snowflake`、DuckDB、Ibis 等的配置）能原样迁移：
+接受 Go ADBC Snowflake 驱动的连接键。早期文档里的别名仍然可用：
 
 | 选项 | 说明 |
 | --- | --- |
 | `uri` | `snowflake://user:pass@account/db/schema?warehouse=&role=`，与分字段选项二选一 |
 | `adbc.snowflake.sql.account` | 账号标识 |
-| `adbc.snowflake.sql.uri`（host 覆盖）| PrivateLink / 中国区 |
+| `adbc.snowflake.sql.uri.host` | host 覆盖（PrivateLink / 中国区）。`adbc.snowflake.sql.uri` 仍作为同一选项的别名 |
 | `username` / `password` | 密码认证 |
 | `adbc.snowflake.sql.auth_type` | `auth_snowflake`（默认）/ `auth_jwt` / `auth_pat` / `auth_oauth` |
 | `adbc.snowflake.sql.client_option.jwt_private_key` | 私钥文件路径 |
@@ -410,10 +418,11 @@ Snowflake 返回的 IPC stream 里，字段 metadata 含 `logicalType`、`scale`
 | `adbc.snowflake.sql.client_option.auth_token` | PAT / OAuth token |
 | `adbc.snowflake.sql.db` / `schema` / `warehouse` / `role` | 会话上下文 |
 | `adbc.snowflake.sql.client_option.app_name` | 写入 `CLIENT_ENVIRONMENT.APPLICATION` |
-| `adbc.snowflake.sql.client_option.use_high_precision` | 本驱动默认 `true`（Decimal128）；设为 `false` 时 scale=0 转 `Int64`、否则 `Float64`，仅为兼容 Go 驱动行为，溢出仍报错 |
+| `adbc.snowflake.sql.client_option.use_high_precision` | 默认 `true`（Decimal128）。`false` 时 scale 0 为 `Int64`、其余为 `Float64`，溢出仍报错。Go 驱动默认同样是 `true` |
 | `adbc.snowflake.rs.timestamp_tz` | `utc`（默认）/ `struct` |
-| `adbc.snowflake.sql.client_option.prefetch_concurrency` | 分片并发数 |
-| `adbc.snowflake.sql.client_option.query_timeout` 等 | 超时 |
+| `adbc.snowflake.sql.uri.port` / `adbc.snowflake.sql.uri.protocol` / `adbc.snowflake.sql.region` | 与 Go 驱动相同。`region` 只在没有显式 host、且 account 本身不带 `.` 时拼进 host |
+| `adbc.snowflake.rpc.prefetch_concurrency` | 分片并发。Go 驱动是 statement 级；本驱动在 statement 上设置时只影响该语句，在 database 上设置时成为会话默认。`adbc.snowflake.sql.client_option.prefetch_concurrency` 仍可用 |
+| `adbc.snowflake.sql.client_option.query_timeout` / `login_timeout` | 超时，单位秒 |
 
 ### 5.2 Trait 映射
 
@@ -423,11 +432,11 @@ Snowflake 返回的 IPC stream 里，字段 metadata 含 `logicalType`、`scale`
 | `Database::new_connection` | `client.connect()` → `Session` |
 | `Connection::new_statement` | 空 `Statement` 持有 `Arc<Session>` |
 | `Connection::get_info` | `VENDOR_NAME = "Snowflake"`、`VENDOR_VERSION`（登录响应里的 `serverVersion`）、`DRIVER_NAME/VERSION`、`DRIVER_ARROW_VERSION` |
-| `Connection::get_objects` | 查询 `INFORMATION_SCHEMA`（或 `SHOW TERSE ...`），按 ADBC `GetObjects` 嵌套 schema 组装（catalog → db_schema → table → column） |
+| `Connection::get_objects` | 先查账号级 `information_schema.databases`，再对每个库查 `"<db>".information_schema.schemata/tables/columns`。未限定的 `information_schema.schemata` 只能看到当前库 |
 | `Connection::get_table_schema` | `describeOnly = true` 执行 `SELECT * FROM <table>`，由 `rowtype` 生成 Arrow Schema（与查询结果 Schema 100% 一致） |
 | `Connection::get_table_types` | 静态：`TABLE`, `VIEW`, `TEMPORARY TABLE`, `TRANSIENT TABLE`, `EXTERNAL TABLE`, `DYNAMIC TABLE`, `HYBRID TABLE` |
 | `Connection::commit` / `rollback` | 执行 `COMMIT` / `ROLLBACK`；`autocommit` 选项对应 `ALTER SESSION SET AUTOCOMMIT` |
-| `Connection::cancel` | 取消当前进行中的查询（abort-request） |
+| `Connection::cancel` | 取消该连接上所有 in-flight 查询（abort-request）。`Statement::cancel` 只取消该语句自己的 request id |
 | `Statement::set_sql_query` / `prepare` | `prepare` 执行 `describeOnly = true` 获取结果 Schema 和 `numberOfBinds` |
 | `Statement::execute` | 执行并返回 `RecordBatchReader` |
 | `Statement::execute_update` | 执行，返回受影响行数（DML 结果集第一行第一列 `number of rows inserted/updated/deleted`；DDL 返回 -1） |
