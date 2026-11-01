@@ -1,8 +1,9 @@
 //! ADBC driver for Snowflake.
 //!
-//! Option keys match the Go ADBC Snowflake driver (`adbc.snowflake.sql.*`) so
-//! existing URIs and configuration keep working. `NUMBER` is `Decimal128`
-//! unless `use_high_precision` is set false.
+//! Host, port, protocol, and region use the Go ADBC Snowflake option names
+//! (`adbc.snowflake.sql.uri.host` and the related keys). `NUMBER` is
+//! `Decimal128` unless `use_high_precision` is set false. That option defaults
+//! to true here and in the Go driver.
 
 mod driver;
 mod error;

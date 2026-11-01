@@ -1,6 +1,11 @@
-//! ADBC option keys. Names match the Go Snowflake driver where the design says so.
+//! ADBC option keys.
+//!
+//! Go's host, port, protocol, and region names are accepted. `adbc.snowflake.sql.uri`
+//! remains a host override for callers who used the name this crate documented first.
+//! Prefetch accepts the Go statement key and the older database key.
 
 use adbc_core::options::{OptionDatabase, OptionValue};
+use percent_encoding::percent_decode_str;
 use snowflake_arrow::{ArrowOptions, TimestampTzMode};
 use snowflake_core::{Authenticator, ClientBuilder, Error as SnowflakeError, SnowflakeClient};
 use url::Url;
@@ -8,7 +13,13 @@ use url::Url;
 use crate::error::{self, adbc_error};
 
 pub const OPT_ACCOUNT: &str = "adbc.snowflake.sql.account";
-pub const OPT_HOST: &str = "adbc.snowflake.sql.uri";
+/// Go ADBC Snowflake driver: explicit host.
+pub const OPT_HOST: &str = "adbc.snowflake.sql.uri.host";
+/// Host override documented by early versions of this crate.
+pub const OPT_HOST_LEGACY: &str = "adbc.snowflake.sql.uri";
+pub const OPT_PORT: &str = "adbc.snowflake.sql.uri.port";
+pub const OPT_PROTOCOL: &str = "adbc.snowflake.sql.uri.protocol";
+pub const OPT_REGION: &str = "adbc.snowflake.sql.region";
 pub const OPT_AUTH_TYPE: &str = "adbc.snowflake.sql.auth_type";
 pub const OPT_JWT_KEY_PATH: &str = "adbc.snowflake.sql.client_option.jwt_private_key";
 pub const OPT_JWT_KEY_VALUE: &str = "adbc.snowflake.sql.client_option.jwt_private_key_pkcs8_value";
@@ -22,7 +33,10 @@ pub const OPT_ROLE: &str = "adbc.snowflake.sql.role";
 pub const OPT_APP_NAME: &str = "adbc.snowflake.sql.client_option.app_name";
 pub const OPT_HIGH_PRECISION: &str = "adbc.snowflake.sql.client_option.use_high_precision";
 pub const OPT_TIMESTAMP_TZ: &str = "adbc.snowflake.rs.timestamp_tz";
-pub const OPT_PREFETCH: &str = "adbc.snowflake.sql.client_option.prefetch_concurrency";
+/// Go ADBC Snowflake driver sets this on the statement.
+pub const OPT_PREFETCH: &str = "adbc.snowflake.rpc.prefetch_concurrency";
+/// Database-level alias kept for callers of this crate's first release.
+pub const OPT_PREFETCH_LEGACY: &str = "adbc.snowflake.sql.client_option.prefetch_concurrency";
 pub const OPT_QUERY_TIMEOUT: &str = "adbc.snowflake.sql.client_option.query_timeout";
 pub const OPT_LOGIN_TIMEOUT: &str = "adbc.snowflake.sql.client_option.login_timeout";
 
@@ -42,6 +56,9 @@ pub struct Settings {
     pub schema: Option<String>,
     pub warehouse: Option<String>,
     pub role: Option<String>,
+    pub port: Option<u16>,
+    pub protocol: Option<String>,
+    pub region: Option<String>,
     pub app_name: Option<String>,
     pub use_high_precision: bool,
     pub timestamp_tz: TimestampTzMode,
@@ -69,7 +86,16 @@ impl Settings {
             OptionDatabase::Username => self.username = Some(text),
             OptionDatabase::Password => self.password = Some(text),
             OptionDatabase::Other(ref name) if name == OPT_ACCOUNT => self.account = Some(text),
-            OptionDatabase::Other(ref name) if name == OPT_HOST => self.host = Some(text),
+            OptionDatabase::Other(ref name) if name == OPT_HOST || name == OPT_HOST_LEGACY => {
+                self.host = Some(text)
+            }
+            OptionDatabase::Other(ref name) if name == OPT_PORT => {
+                self.port = Some(parse_port(&text)?)
+            }
+            OptionDatabase::Other(ref name) if name == OPT_PROTOCOL => {
+                self.protocol = Some(parse_protocol(&text)?)
+            }
+            OptionDatabase::Other(ref name) if name == OPT_REGION => self.region = Some(text),
             OptionDatabase::Other(ref name) if name == OPT_AUTH_TYPE => self.auth_type = Some(text),
             OptionDatabase::Other(ref name) if name == OPT_JWT_KEY_PATH => {
                 self.jwt_path = Some(text)
@@ -102,7 +128,9 @@ impl Settings {
                     }
                 };
             }
-            OptionDatabase::Other(ref name) if name == OPT_PREFETCH => {
+            OptionDatabase::Other(ref name)
+                if name == OPT_PREFETCH || name == OPT_PREFETCH_LEGACY =>
+            {
                 self.prefetch = Some(parse_u64(&text)? as usize);
             }
             OptionDatabase::Other(ref name) if name == OPT_QUERY_TIMEOUT => {
@@ -124,13 +152,17 @@ impl Settings {
             "uri" => self.uri.clone(),
             "username" => self.username.clone(),
             OPT_ACCOUNT => self.account.clone(),
-            OPT_HOST => self.host.clone(),
+            OPT_HOST | OPT_HOST_LEGACY => self.host.clone(),
+            OPT_PORT => self.port.map(|port| port.to_string()),
+            OPT_PROTOCOL => self.protocol.clone(),
+            OPT_REGION => self.region.clone(),
             OPT_AUTH_TYPE => self.auth_type.clone(),
             OPT_DATABASE => self.database.clone(),
             OPT_SCHEMA => self.schema.clone(),
             OPT_WAREHOUSE => self.warehouse.clone(),
             OPT_ROLE => self.role.clone(),
             OPT_APP_NAME => self.app_name.clone(),
+            OPT_PREFETCH | OPT_PREFETCH_LEGACY => self.prefetch.map(|value| value.to_string()),
             OPT_HIGH_PRECISION => Some(self.use_high_precision.to_string()),
             OPT_TIMESTAMP_TZ => Some(
                 match self.timestamp_tz {
@@ -164,7 +196,7 @@ impl Settings {
             .ok_or_else(|| error::invalid("username is required"))?;
         let authenticator = authenticator(self).map_err(adbc_error)?;
         let mut builder = ClientBuilder::new()
-            .account(account)
+            .account(account.clone())
             .user(user)
             .authenticator(authenticator);
         if let Some(value) = &self.warehouse {
@@ -181,6 +213,14 @@ impl Settings {
         }
         if let Some(value) = &self.host {
             builder = builder.host(value);
+        } else if let Some(host) = host_with_region(&account, self.region.as_deref()) {
+            builder = builder.host(host);
+        }
+        if let Some(port) = self.port {
+            builder = builder.port(port);
+        }
+        if let Some(protocol) = &self.protocol {
+            builder = builder.protocol(protocol);
         }
         if let Some(value) = &self.app_name {
             builder = builder.app_name(value);
@@ -239,6 +279,7 @@ pub fn apply_uri(settings: &mut Settings, uri: &str) -> adbc_core::error::Result
     if let Some(host) = url.host_str() {
         settings.account = Some(host.to_string());
     }
+    // `Url` returns userinfo and path still percent-encoded.
     if !url.username().is_empty() {
         settings.username = Some(percent_decode(url.username()));
     }
@@ -268,24 +309,7 @@ pub fn apply_uri(settings: &mut Settings, uri: &str) -> adbc_core::error::Result
 }
 
 fn percent_decode(value: &str) -> String {
-    let mut out = String::with_capacity(value.len());
-    let bytes = value.as_bytes();
-    let mut index = 0;
-    while index < bytes.len() {
-        if bytes[index] == b'%' && index + 2 < bytes.len() {
-            if let Ok(byte) = u8::from_str_radix(
-                std::str::from_utf8(&bytes[index + 1..index + 3]).unwrap_or(""),
-                16,
-            ) {
-                out.push(byte as char);
-                index += 3;
-                continue;
-            }
-        }
-        out.push(bytes[index] as char);
-        index += 1;
-    }
-    out
+    percent_decode_str(value).decode_utf8_lossy().into_owned()
 }
 
 pub fn option_string(value: &OptionValue) -> adbc_core::error::Result<String> {
@@ -311,6 +335,30 @@ fn parse_bool(value: &str) -> adbc_core::error::Result<bool> {
     }
 }
 
+fn parse_port(value: &str) -> adbc_core::error::Result<u16> {
+    value
+        .parse()
+        .map_err(|err| error::invalid(format!("port: {err}")))
+}
+
+fn parse_protocol(value: &str) -> adbc_core::error::Result<String> {
+    match value {
+        "http" | "https" => Ok(value.to_string()),
+        other => Err(error::invalid(format!(
+            "protocol must be http or https, got {other}"
+        ))),
+    }
+}
+
+/// `account` plus `region` when the account is not already a host.
+fn host_with_region(account: &str, region: Option<&str>) -> Option<String> {
+    let region = region.map(str::trim).filter(|region| !region.is_empty())?;
+    if account.split('.').nth(1).is_some() {
+        return None;
+    }
+    Some(snowflake_core::default_host(&format!("{account}.{region}")))
+}
+
 fn parse_u64(value: &str) -> adbc_core::error::Result<u64> {
     value
         .parse()
@@ -319,6 +367,8 @@ fn parse_u64(value: &str) -> adbc_core::error::Result<u64> {
 
 #[cfg(test)]
 mod tests {
+    use adbc_core::options::{OptionDatabase, OptionValue};
+
     use super::*;
 
     #[test]
@@ -336,5 +386,61 @@ mod tests {
         assert_eq!(settings.schema.as_deref(), Some("PUBLIC"));
         assert_eq!(settings.warehouse.as_deref(), Some("WH"));
         assert_eq!(settings.role.as_deref(), Some("R"));
+    }
+
+    #[test]
+    fn uri_decodes_utf8_password_and_database() {
+        let mut settings = Settings::new();
+        apply_uri(
+            &mut settings,
+            "snowflake://svc:%E4%B8%AD%E6%96%87@acct/D%C3%A9/SCH",
+        )
+        .unwrap();
+        assert_eq!(settings.password.as_deref(), Some("中文"));
+        assert_eq!(settings.database.as_deref(), Some("Dé"));
+        assert_eq!(settings.schema.as_deref(), Some("SCH"));
+    }
+
+    #[test]
+    fn go_driver_uri_and_prefetch_keys_are_accepted() {
+        let mut settings = Settings::new();
+        settings.account = Some("xy12345".into());
+        settings.username = Some("svc".into());
+        settings.password = Some("pw".into());
+        for (key, value) in [
+            ("adbc.snowflake.sql.uri.host", "ignored.example"),
+            ("adbc.snowflake.sql.uri.port", "8443"),
+            ("adbc.snowflake.sql.uri.protocol", "https"),
+            ("adbc.snowflake.sql.region", "us-east-1.aws"),
+            ("adbc.snowflake.rpc.prefetch_concurrency", "3"),
+        ] {
+            settings
+                .set_database_option(
+                    OptionDatabase::Other(key.into()),
+                    OptionValue::String(value.into()),
+                )
+                .unwrap();
+        }
+        // An explicit host wins over region.
+        let client = settings.build_client().unwrap();
+        assert_eq!(client.config().host.as_deref(), Some("ignored.example"));
+        assert_eq!(client.config().port, Some(8443));
+        assert_eq!(client.config().protocol, "https");
+        assert_eq!(client.config().prefetch_concurrency, 3);
+
+        settings.host = None;
+        let client = settings.build_client().unwrap();
+        assert_eq!(
+            client.config().host.as_deref(),
+            Some("xy12345.us-east-1.aws.snowflakecomputing.com")
+        );
+
+        settings
+            .set_database_option(
+                OptionDatabase::Other("adbc.snowflake.sql.uri".into()),
+                OptionValue::String("legacy.example".into()),
+            )
+            .unwrap();
+        assert_eq!(settings.host.as_deref(), Some("legacy.example"));
     }
 }

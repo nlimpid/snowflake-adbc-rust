@@ -163,6 +163,7 @@ impl Session {
             async_exec: false,
             parameters: HashMap::new(),
             request_id: None,
+            prefetch: None,
         }
     }
 
@@ -221,7 +222,9 @@ impl Session {
         let generation = self.inner.cancel_generation.load(Ordering::SeqCst);
         // The original client request id is not known here. Abort must use queryId.
         self.set_inflight(None, Some(query_id.to_string()), "");
-        let result = self.poll_until_complete(&path, None, generation).await;
+        let result = self
+            .poll_until_complete(&path, None, generation, None)
+            .await;
         if matches!(result, Err(Error::Timeout)) {
             self.abort_after_timeout().await;
         }
@@ -354,8 +357,14 @@ impl Session {
                 deadline,
             )
             .await?;
-        self.finish_query(envelope, query.async_exec, generation, deadline)
-            .await
+        self.finish_query(
+            envelope,
+            query.async_exec,
+            generation,
+            deadline,
+            query.prefetch,
+        )
+        .await
     }
 
     async fn finish_query(
@@ -364,9 +373,10 @@ impl Session {
         async_exec: bool,
         generation: u64,
         deadline: Option<Instant>,
+        prefetch: Option<usize>,
     ) -> Result<QueryResult> {
         if envelope.success {
-            return self.result_from_data(envelope.data()?, false);
+            return self.result_from_data(envelope.data()?, false, prefetch);
         }
         let code = envelope.code.clone().unwrap_or_default();
         if Error::is_query_in_progress(&code) {
@@ -386,7 +396,7 @@ impl Session {
             }
             if async_exec {
                 if let Some(data) = data.as_ref() {
-                    let mut result = self.result_from_data(data, true)?;
+                    let mut result = self.result_from_data(data, true, prefetch)?;
                     if let Some(query_id) = query_id {
                         result.set_query_id_if_empty(query_id);
                     }
@@ -401,7 +411,9 @@ impl Session {
                     query_id.ok_or_else(|| Error::protocol("running query has no id"))?
                 ),
             };
-            return self.poll_until_complete(&path, deadline, generation).await;
+            return self
+                .poll_until_complete(&path, deadline, generation, prefetch)
+                .await;
         }
         Err(error_from_envelope(&envelope))
     }
@@ -411,6 +423,7 @@ impl Session {
         path: &str,
         deadline: Option<Instant>,
         generation: u64,
+        prefetch: Option<usize>,
     ) -> Result<QueryResult> {
         let mut delay = POLL_INITIAL;
         loop {
@@ -427,7 +440,7 @@ impl Session {
                 )
                 .await?;
             if envelope.success {
-                return self.result_from_data(envelope.data()?, false);
+                return self.result_from_data(envelope.data()?, false, prefetch);
             }
             let code = envelope.code.clone().unwrap_or_default();
             if !Error::is_query_in_progress(&code) {
@@ -438,7 +451,12 @@ impl Session {
         }
     }
 
-    fn result_from_data(&self, data: &Value, pending: bool) -> Result<QueryResult> {
+    fn result_from_data(
+        &self,
+        data: &Value,
+        pending: bool,
+        prefetch: Option<usize>,
+    ) -> Result<QueryResult> {
         let parsed = QueryData::from_value(data)?;
         {
             let mut state = write_lock(&self.inner.state);
@@ -508,7 +526,9 @@ impl Session {
             parsed.chunks,
             self.inner.http.clone(),
             headers,
-            self.inner.config.prefetch_concurrency,
+            prefetch
+                .unwrap_or(self.inner.config.prefetch_concurrency)
+                .max(1),
             self.inner.user_agent.clone(),
         ))
     }
@@ -1184,6 +1204,7 @@ struct QueryParts {
     async_exec: bool,
     parameters: HashMap<String, String>,
     request_id: Option<String>,
+    prefetch: Option<usize>,
 }
 
 /// A statement built on a [`Session`].
@@ -1195,6 +1216,7 @@ pub struct Query<'a> {
     async_exec: bool,
     parameters: HashMap<String, String>,
     request_id: Option<String>,
+    prefetch: Option<usize>,
 }
 
 impl<'a> Query<'a> {
@@ -1229,6 +1251,12 @@ impl<'a> Query<'a> {
         self
     }
 
+    /// Chunk-download concurrency for this statement. Falls back to the session default.
+    pub fn prefetch(mut self, threads: usize) -> Self {
+        self.prefetch = Some(threads.max(1));
+        self
+    }
+
     pub async fn execute(self) -> Result<QueryResult> {
         self.session
             .execute(QueryParts {
@@ -1238,6 +1266,7 @@ impl<'a> Query<'a> {
                 async_exec: self.async_exec,
                 parameters: self.parameters,
                 request_id: self.request_id,
+                prefetch: self.prefetch,
             })
             .await
     }

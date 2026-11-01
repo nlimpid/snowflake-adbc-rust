@@ -31,6 +31,7 @@ arrow-schema = "=59.3.1"
 base64 = "0.22"
 bytes = "1"
 futures = "=0.3.34"
+percent-encoding = "2.3"
 pkcs8 = { version = "0.10", features = ["pem", "std", "encryption"] }
 reqwest = { version = "=0.13.5", default-features = false, features = ["json", "rustls", "gzip", "stream"] }
 rsa = { version = "0.9", features = ["sha2", "pem"] }

@@ -48,30 +48,30 @@ pub fn objects_reader(
             catalogs.entry(name.clone()).or_default();
         }
     }
+    let databases: Vec<String> = catalogs.keys().cloned().collect();
     if want_schemas {
-        let rows = query_rows(
-            session,
-            runtime,
-            opts,
-            &format!(
-                "SELECT catalog_name::varchar, schema_name::varchar \
-                 FROM information_schema.schemata WHERE 1 = 1{}{}",
-                like_predicate("catalog_name", catalog),
-                like_predicate("schema_name", db_schema)
-            ),
-        )?;
-        for row in rows {
-            let Some(catalog_name) = row.first().and_then(Option::as_ref) else {
-                continue;
-            };
-            let Some(schema_name) = row.get(1).and_then(Option::as_ref) else {
-                continue;
-            };
-            catalogs
-                .entry(catalog_name.clone())
-                .or_default()
-                .entry(schema_name.clone())
-                .or_default();
+        for database in &databases {
+            let rows = query_rows(
+                session,
+                runtime,
+                opts,
+                &format!(
+                    "SELECT schema_name::varchar \
+                     FROM {}.information_schema.schemata WHERE 1 = 1{}",
+                    quote_ident(database),
+                    like_predicate("schema_name", db_schema)
+                ),
+            )?;
+            for row in rows {
+                let Some(schema_name) = row.first().and_then(Option::as_ref) else {
+                    continue;
+                };
+                catalogs
+                    .entry(database.clone())
+                    .or_default()
+                    .entry(schema_name.clone())
+                    .or_default();
+            }
         }
     }
     if want_tables {
@@ -86,93 +86,93 @@ pub fn objects_reader(
             ),
             _ => String::new(),
         };
-        let rows = query_rows(
-            session,
-            runtime,
-            opts,
-            &format!(
-                "SELECT table_catalog::varchar, table_schema::varchar, table_name::varchar, table_type::varchar \
-                 FROM information_schema.tables WHERE 1 = 1{}{}{}{type_filter}",
-                like_predicate("table_catalog", catalog),
-                like_predicate("table_schema", db_schema),
-                like_predicate("table_name", table_name),
-            ),
-        )?;
-        for row in rows {
-            let (Some(catalog_name), Some(schema_name), Some(name), Some(ty)) = (
-                row.first().and_then(Option::as_ref),
-                row.get(1).and_then(Option::as_ref),
-                row.get(2).and_then(Option::as_ref),
-                row.get(3).and_then(Option::as_ref),
-            ) else {
-                continue;
-            };
-            catalogs
-                .entry(catalog_name.clone())
-                .or_default()
-                .entry(schema_name.clone())
-                .or_default()
-                .insert(
-                    name.clone(),
-                    Table {
-                        ty: ty.clone(),
-                        columns: if want_columns { Some(Vec::new()) } else { None },
-                    },
-                );
+        for database in &databases {
+            let rows = query_rows(
+                session,
+                runtime,
+                opts,
+                &format!(
+                    "SELECT table_schema::varchar, table_name::varchar, table_type::varchar \
+                     FROM {}.information_schema.tables WHERE 1 = 1{}{}{type_filter}",
+                    quote_ident(database),
+                    like_predicate("table_schema", db_schema),
+                    like_predicate("table_name", table_name),
+                ),
+            )?;
+            for row in rows {
+                let (Some(schema_name), Some(name), Some(ty)) = (
+                    row.first().and_then(Option::as_ref),
+                    row.get(1).and_then(Option::as_ref),
+                    row.get(2).and_then(Option::as_ref),
+                ) else {
+                    continue;
+                };
+                catalogs
+                    .entry(database.clone())
+                    .or_default()
+                    .entry(schema_name.clone())
+                    .or_default()
+                    .insert(
+                        name.clone(),
+                        Table {
+                            ty: ty.clone(),
+                            columns: if want_columns { Some(Vec::new()) } else { None },
+                        },
+                    );
+            }
         }
     }
     if want_columns {
-        let rows = query_rows(
-            session,
-            runtime,
-            opts,
-            &format!(
-                "SELECT table_catalog::varchar, table_schema::varchar, table_name::varchar, \
+        for database in &databases {
+            let rows = query_rows(
+                session,
+                runtime,
+                opts,
+                &format!(
+                    "SELECT table_schema::varchar, table_name::varchar, \
                         column_name::varchar, ordinal_position::varchar, is_nullable::varchar, \
                         data_type::varchar, comment::varchar \
-                 FROM information_schema.columns WHERE 1 = 1{}{}{}{}",
-                like_predicate("table_catalog", catalog),
-                like_predicate("table_schema", db_schema),
-                like_predicate("table_name", table_name),
-                like_predicate("column_name", column_name),
-            ),
-        )?;
-        for row in rows {
-            let Some(catalog_name) = row.first().and_then(Option::as_ref) else {
-                continue;
-            };
-            let Some(schema_name) = row.get(1).and_then(Option::as_ref) else {
-                continue;
-            };
-            let Some(table) = row.get(2).and_then(Option::as_ref) else {
-                continue;
-            };
-            let Some(column) = row.get(3).and_then(Option::as_ref) else {
-                continue;
-            };
-            let ordinal = row
-                .get(4)
-                .and_then(Option::as_ref)
-                .and_then(|value| value.parse().ok())
-                .unwrap_or(0);
-            let entry = catalogs
-                .entry(catalog_name.clone())
-                .or_default()
-                .entry(schema_name.clone())
-                .or_default()
-                .entry(table.clone())
-                .or_insert_with(|| Table {
-                    ty: "TABLE".into(),
-                    columns: Some(Vec::new()),
-                });
-            if let Some(columns) = entry.columns.as_mut() {
-                columns.push(Column {
-                    name: column.clone(),
-                    ordinal,
-                    nullable: row.get(5).and_then(Clone::clone),
-                    data_type: row.get(6).and_then(Clone::clone),
-                    comment: row.get(7).and_then(Clone::clone),
-                });
+                     FROM {}.information_schema.columns WHERE 1 = 1{}{}{}",
+                    quote_ident(database),
+                    like_predicate("table_schema", db_schema),
+                    like_predicate("table_name", table_name),
+                    like_predicate("column_name", column_name),
+                ),
+            )?;
+            for row in rows {
+                let Some(schema_name) = row.first().and_then(Option::as_ref) else {
+                    continue;
+                };
+                let Some(table) = row.get(1).and_then(Option::as_ref) else {
+                    continue;
+                };
+                let Some(column) = row.get(2).and_then(Option::as_ref) else {
+                    continue;
+                };
+                let ordinal = row
+                    .get(3)
+                    .and_then(Option::as_ref)
+                    .and_then(|value| value.parse().ok())
+                    .unwrap_or(0);
+                let entry = catalogs
+                    .entry(database.clone())
+                    .or_default()
+                    .entry(schema_name.clone())
+                    .or_default()
+                    .entry(table.clone())
+                    .or_insert_with(|| Table {
+                        ty: "TABLE".into(),
+                        columns: Some(Vec::new()),
+                    });
+                if let Some(columns) = entry.columns.as_mut() {
+                    columns.push(Column {
+                        name: column.clone(),
+                        ordinal,
+                        nullable: row.get(4).and_then(Clone::clone),
+                        data_type: row.get(5).and_then(Clone::clone),
+                        comment: row.get(6).and_then(Clone::clone),
+                    });
+                }
             }
         }
     }
@@ -581,4 +581,28 @@ fn like_predicate(column: &str, pattern: Option<&str>) -> String {
 
 fn sql_string(value: &str) -> String {
     format!("'{}'", value.replace('\'', "''"))
+}
+
+fn quote_ident(name: &str) -> String {
+    format!("\"{}\"", name.replace('"', "\"\""))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn metadata_queries_are_qualified_by_database() {
+        let sql = format!(
+            "SELECT schema_name::varchar FROM {}.information_schema.schemata WHERE 1 = 1{}",
+            quote_ident("OTHER_DB"),
+            like_predicate("schema_name", Some("PUBLIC"))
+        );
+        assert_eq!(
+            sql,
+            "SELECT schema_name::varchar FROM \"OTHER_DB\".information_schema.schemata WHERE 1 = 1 AND schema_name LIKE 'PUBLIC'"
+        );
+        assert_eq!(quote_ident("A\"B"), "\"A\"\"B\"");
+        assert!(!sql.contains("FROM information_schema.schemata"));
+    }
 }

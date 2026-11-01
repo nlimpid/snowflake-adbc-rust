@@ -104,6 +104,10 @@ Load `libadbc_driver_snowflake_rs.so` from Python, Go, or C++ with init function
 | `VECTOR` | `FixedSizeList(Float32, n)` |
 | anything else | error |
 
+## Go ADBC option keys
+
+Host, port, protocol, and region use the Go driver's names: `adbc.snowflake.sql.uri.host`, `adbc.snowflake.sql.uri.port`, `adbc.snowflake.sql.uri.protocol`, and `adbc.snowflake.sql.region`. `adbc.snowflake.sql.uri` is still accepted as a host override. Prefetch accepts the statement option `adbc.snowflake.rpc.prefetch_concurrency` and the database option `adbc.snowflake.sql.client_option.prefetch_concurrency`.
+
 ## Not implemented
 
 PUT/GET file transfer, browser SSO, interactive MFA, OCSP stapling, Substrait, and partition hand-off (`execute_partitions`). `bindStage` uploads for very large array binds are not implemented; the server error is returned as-is.

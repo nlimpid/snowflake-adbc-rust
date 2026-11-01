@@ -23,6 +23,7 @@ arrow-array.workspace = true
 arrow-buffer.workspace = true
 arrow-schema.workspace = true
 futures.workspace = true
+percent-encoding.workspace = true
 snowflake-arrow.workspace = true
 snowflake-core.workspace = true
 tokio.workspace = true
