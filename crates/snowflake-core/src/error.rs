@@ -14,8 +14,8 @@ pub const CODE_QUERY_RUNNING: &str = "333333";
 pub const CODE_QUERY_WAITING: &str = "333334";
 
 pub const MFA_MESSAGE: &str =
-    "该用户需要 MFA，驱动不支持交互式 MFA，请使用 Key-Pair 或把用户设为 LEGACY_SERVICE";
-pub const JWT_MESSAGE: &str = "JWT is invalid. The public key fingerprint registered for the user does not match this key, or the client and server clocks differ by more than Snowflake allows";
+    "this user requires MFA; the driver does not support interactive MFA. Use key-pair authentication or set the user TYPE to LEGACY_SERVICE";
+pub const JWT_MESSAGE: &str = "JWT was rejected. It may have expired during a retry, the client and server clocks may differ, or the public key fingerprint registered for the user does not match this key";
 
 #[derive(Error, Debug)]
 pub enum Error {
@@ -89,5 +89,16 @@ impl Error {
 
     pub fn is_master_expired(code: &str) -> bool {
         matches!(code, CODE_MASTER_EXPIRED | CODE_SESSION_GONE)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn messages_returned_to_callers_are_english() {
+        assert!(MFA_MESSAGE.is_ascii());
+        assert!(JWT_MESSAGE.is_ascii());
     }
 }

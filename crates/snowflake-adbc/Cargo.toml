@@ -12,11 +12,6 @@ keywords.workspace = true
 categories.workspace = true
 readme = "../../README.md"
 
-[features]
-default = []
-# The C ABI lives in the snowflake-adbc-ffi crate, which depends on this one.
-ffi = []
-
 [dependencies]
 adbc_core.workspace = true
 arrow-array.workspace = true

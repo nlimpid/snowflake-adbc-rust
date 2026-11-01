@@ -1,8 +1,9 @@
 //! Real-account test helpers.
 //!
 //! Tests call [`test_session`]. When `SNOWFLAKE_TEST_*` is unset the helper
-//! returns [`None`] and the test returns. CI sets `SNOWFLAKE_TEST_REQUIRED=1`,
-//! which panics instead so a missing secret cannot look like a pass.
+//! returns [`None`] and the test returns. `SNOWFLAKE_TEST_REQUIRED=1` panics
+//! instead, so a caller who set that flag cannot mistake a missing secret for
+//! a pass. The GitHub Actions workflow does not set it.
 
 use std::env;
 

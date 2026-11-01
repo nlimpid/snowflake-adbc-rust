@@ -12,14 +12,14 @@
 | --- | --- | --- | --- | --- |
 | `snowflake-connector-rs`（estie） | 仅 JSON rowset | 密码 / Key-Pair | reqwest，不依赖 arrow | 没有 Arrow 结果格式，大结果集走 JSON 字符串解析，数值/时间全部是文本再转换；要做 ADBC 还得自己把 JSON 转 Arrow，等于重做一半 |
 | `snowflake-api`（mycelial） | Arrow（伪装 Go 驱动）+ JSON | 密码 / Key-Pair | reqwest + arrow | 维护活跃度一般，arrow 版本容易和我们锁死的版本冲突；错误处理与类型映射不够严格（部分类型退化为字符串） |
-| 通过 ADBC driver manager 加载官方 Go 驱动（`libadbc_driver_snowflake.so`） | Arrow | 全部 | cgo 产物、C FFI | 需要分发平台相关的动态库，构建链路复杂；类型映射由 Go 驱动决定（默认 NUMBER 会被转成 int64/float64，有精度丢失），无法按我们的严格要求定制 |
-| **自研（本方案）** | Arrow + JSON 双解码 | 密码 → JWT → 其他 | reqwest（与 castor 对齐）、arrow（可选 feature） | 需要自己实现协议，但协议面不大（登录、查询、分片下载、续期、取消），且可以完全控制类型映射和错误语义 |
+| 通过 ADBC driver manager 加载官方 Go 驱动（`libadbc_driver_snowflake.so`） | Arrow | 全部 | cgo 产物、C FFI | 需要分发平台相关的动态库，构建链路复杂。Go 驱动的 `use_high_precision` **默认就是 `true`**（`Decimal128`）；设为 `false` 才把 scale 0 收成 int64、其余收成 float64。不能按我们的错误语义定制 |
+| **自研（本方案）** | Arrow + JSON 双解码 | 密码 → JWT → 其他 | reqwest 0.13.5、arrow | 需要自己实现协议，但协议面不大（登录、查询、分片下载、续期、取消），且可以完全控制类型映射和错误语义 |
 
 选择自研的核心原因：
 
-1. **类型映射必须严格可控**。Snowflake 的 Arrow 物理编码比较特殊（`NUMBER` 可能是带 `scale` 元数据的 `Int64`，`TIMESTAMP` 可能是 `Struct{epoch, fraction}`），现有库的处理方式要么丢精度，要么静默转字符串。
+1. **类型映射必须严格可控**。Snowflake 的 Arrow 物理编码比较特殊（`NUMBER` 可能是带 `scale` 元数据的 `Int64`，`TIMESTAMP` 可能是 `Struct{epoch, fraction}`）。这不是因为 Go ADBC 驱动默认丢精度：它的 `use_high_precision` 默认就是 `true`。自研是为了解码失败直接报错，而不是静默转字符串或由 cgo 动态库决定行为。
 2. **双结果格式不可避免**。即使协商了 Arrow，DDL / `SHOW` / `DESCRIBE` 等语句仍然返回 JSON rowset，任何驱动都必须同时实现两套解码，社区库在 JSON 分支普遍比较随意。
-3. **依赖版本自主**。reqwest 版本和 castor 一致，arrow 版本和 ADBC 一致，不被第三方库锁死。
+3. **依赖版本自主**。reqwest 锁在 0.13.5，arrow 版本和 ADBC 一致，不被第三方库锁死。
 4. **协议本身稳定**。Snowflake 的 REST 接口（`/session/v1/login-request`、`/queries/v1/query-request` 等）多年未变，官方 Go / Python 驱动是可参考的开源实现。
 
 ### 1.2 认证现状
@@ -61,7 +61,7 @@ snowflake-rs/                      # Cargo workspace
 
 | 用途 | crate | 说明 |
 | --- | --- | --- |
-| HTTP | `reqwest` 0.13.5（features: `json`, `rustls`, `gzip`, `stream`） | 版本和 feature 与 castor-agent 对齐；`gzip`、`stream` 是分片下载额外需要的 |
+| HTTP | `reqwest` 0.13.5（features: `json`, `rustls`, `gzip`, `stream`） | `gzip`、`stream` 是分片下载额外需要的 |
 | 异步运行时 | `tokio` | 核心 API 是 async；ADBC 层内部持有/借用 runtime 做同步桥接 |
 | 序列化 | `serde`, `serde_json` | 协议请求/响应 |
 | Arrow | `arrow-array`, `arrow-schema`, `arrow-ipc`, `arrow-buffer` | **版本与 `adbc_core` 依赖的 arrow 大版本对齐**（arrow-rs 每月出大版本，必须锁定） |
@@ -73,9 +73,7 @@ snowflake-rs/                      # Cargo workspace
 
 ### 2.3 Feature flags
 
-- `snowflake-core`：无可选 feature（保持最小）。
-- `snowflake-arrow`：默认开启。
-- `snowflake-adbc`：`ffi`（构建 cdylib）。
+四个库都没有可选 feature。C ABI 在独立的 `snowflake-adbc-ffi` crate 里，不靠 `snowflake-adbc` 的 feature 开关。
 
 ---
 
@@ -208,11 +206,12 @@ struct Session {
 
 #### Arrow 结果格式协商
 
-Snowflake 服务端按 `CLIENT_APP_ID` 决定结果格式参数名：Go 驱动是 `GO_QUERY_RESULT_FORMAT`，Python 是 `PYTHON_CONNECTOR_QUERY_RESULT_FORMAT`，JDBC 是 `JDBC_QUERY_RESULT_FORMAT`。没有面向未知客户端的通用参数。做法与 `snowflake-api`、ADBC Go 驱动一致：
+Snowflake 服务端按 `CLIENT_APP_ID` 决定结果格式参数名：Go 驱动是 `GO_QUERY_RESULT_FORMAT`，Python 是 `PYTHON_CONNECTOR_QUERY_RESULT_FORMAT`，JDBC 是 `JDBC_QUERY_RESULT_FORMAT`。没有面向未知客户端的通用参数。当前实现：
 
-- 登录时 `CLIENT_APP_ID = "Go"`、`CLIENT_APP_VERSION` 填一个较新的 gosnowflake 版本号，`SESSION_PARAMETERS` 中带 `"GO_QUERY_RESULT_FORMAT": "ARROW"`。
-- `User-Agent` 和 `CLIENT_ENVIRONMENT.APPLICATION` 仍然如实写我们自己的名字，便于在 `QUERY_HISTORY` 里区分。
-- 该参数的具体名字与是否必须显式传递，在首次联调时用真实账号确认（这是整个协议中唯一的灰色地带，其余均有公开驱动源码可对照）。
+- 登录体把 `CLIENT_APP_ID` 固定写成 `"Go"`，`CLIENT_APP_VERSION` 固定写成 `"1.13.3"`，并在 `SESSION_PARAMETERS` 里带 `"GO_QUERY_RESULT_FORMAT": "ARROW"`。这是兼容垫片，不是本 crate 的版本号。`app_name` 只进入 `CLIENT_ENVIRONMENT.APPLICATION`。
+- Snowflake 有最低驱动版本策略，这个固定版本以后可能被拒绝。这一点还没有对当前账号验证。
+- `User-Agent` 仍然写 `snowflake-rs/<crate version>`。
+- 参数名和账号是否允许 Arrow，仍以 §9 为准。代码按这个垫片发送，但没有真实账号证明服务端接受。
 
 无论协商结果如何，解码器都必须同时支持两种格式：DDL、`SHOW ...`、`DESCRIBE ...`、`USE ...` 以及部分很小的结果集在 Arrow 模式下仍然以 JSON 返回。
 
@@ -321,7 +320,7 @@ JSON rowset     ──strict parse per rowtype───────────�
 
 | Snowflake 逻辑类型（`rowtype.type`） | 目标 Arrow 类型 | 说明 |
 | --- | --- | --- |
-| `fixed`（NUMBER(p, s)） | `Decimal128(p, s)` | 始终用 Decimal，保精度。不像 Go ADBC 默认转 int64/float64。调用方要 int64 可以自己 cast |
+| `fixed`（NUMBER(p, s)） | `Decimal128(p, s)` | 默认 Decimal128，保精度。`use_high_precision=false` 时 scale 0 为 `Int64`、其余为 `Float64`，溢出仍报错。Go ADBC 驱动该选项默认也是 `true` |
 | `real`（FLOAT） | `Float64` | JSON 中 `"inf"`、`"-inf"`、`"NaN"` 要能解析 |
 | `text` | `Utf8` | `length` 写入 field metadata |
 | `binary` | `Binary` | JSON 中为 hex 字符串，奇数长度或非 hex 字符 → 错误 |
@@ -396,13 +395,13 @@ Snowflake 返回的 IPC stream 里，字段 metadata 含 `logicalType`、`scale`
 
 ### 5.1 选项键
 
-兼容官方 Go ADBC Snowflake 驱动的键名，这样现有用 Go 驱动的 ADBC 调用方（Python `adbc_driver_snowflake`、DuckDB、Ibis 等的配置）能原样迁移：
+键名用了 `adbc.snowflake.sql.*` 前缀，但**不能**把 Go ADBC Snowflake 驱动的配置原样搬过来：
 
 | 选项 | 说明 |
 | --- | --- |
 | `uri` | `snowflake://user:pass@account/db/schema?warehouse=&role=`，与分字段选项二选一 |
 | `adbc.snowflake.sql.account` | 账号标识 |
-| `adbc.snowflake.sql.uri`（host 覆盖）| PrivateLink / 中国区 |
+| `adbc.snowflake.sql.uri` | 本驱动的 host 覆盖。Go 驱动是 `adbc.snowflake.sql.uri.host`，另有 `adbc.snowflake.sql.uri.port`、`adbc.snowflake.sql.uri.protocol`、`adbc.snowflake.sql.region`。这三项本驱动没有；Go 的 host 键会被当成未知选项拒绝 |
 | `username` / `password` | 密码认证 |
 | `adbc.snowflake.sql.auth_type` | `auth_snowflake`（默认）/ `auth_jwt` / `auth_pat` / `auth_oauth` |
 | `adbc.snowflake.sql.client_option.jwt_private_key` | 私钥文件路径 |
@@ -410,9 +409,9 @@ Snowflake 返回的 IPC stream 里，字段 metadata 含 `logicalType`、`scale`
 | `adbc.snowflake.sql.client_option.auth_token` | PAT / OAuth token |
 | `adbc.snowflake.sql.db` / `schema` / `warehouse` / `role` | 会话上下文 |
 | `adbc.snowflake.sql.client_option.app_name` | 写入 `CLIENT_ENVIRONMENT.APPLICATION` |
-| `adbc.snowflake.sql.client_option.use_high_precision` | 本驱动默认 `true`（Decimal128）；设为 `false` 时 scale=0 转 `Int64`、否则 `Float64`，仅为兼容 Go 驱动行为，溢出仍报错 |
+| `adbc.snowflake.sql.client_option.use_high_precision` | 本驱动默认 `true`（Decimal128）。设为 `false` 时 scale=0 转 `Int64`、否则 `Float64`，溢出仍报错。Go 驱动该选项默认同样是 `true`，`false` 才是有损模式 |
 | `adbc.snowflake.rs.timestamp_tz` | `utc`（默认）/ `struct` |
-| `adbc.snowflake.sql.client_option.prefetch_concurrency` | 分片并发数 |
+| `adbc.snowflake.sql.client_option.prefetch_concurrency` | 本驱动的 database 级分片并发。Go 驱动是 statement 级的 `adbc.snowflake.rpc.prefetch_concurrency` |
 | `adbc.snowflake.sql.client_option.query_timeout` 等 | 超时 |
 
 ### 5.2 Trait 映射
@@ -482,9 +481,11 @@ Snowflake 返回的 IPC stream 里，字段 metadata 含 `logicalType`、`scale`
 
 ## 7. 测试策略
 
-照搬 gosnowflake 的做法：**不做 HTTP mock，不录 fixture，所有测试连真实账号**。测试代码与被测代码放在同一个源文件的 `#[cfg(test)] mod tests` 里（对应 Go 的 `*_test.go` 同目录），凭据通过环境变量注入，CI 从仓库内加密的参数文件解密出来。
+仓库里实际跑起来的是纯函数测试，外加 `crates/snowflake-testing/src/live.rs` 里的 4 个真实账号测试（`select 1`、错误密码、篡改 session token 后续期、`NUMBER(10,3)` 的 Arrow/JSON 对比）。凭据来自环境变量。没设置 `SNOWFLAKE_TEST_*` 时这 4 个测试打印一行 skip 并返回，`cargo test` 仍然是绿的。
 
-唯一的例外是不涉及网络的纯函数（JSON 单元格解析、JWT 签名与指纹计算、账号名/host 推导、绑定参数编码）。它们用普通 `#[test]` 直接测，这不是 mock，只是不需要会话。
+不做 HTTP mock，也不录 fixture。下面 7.3 里除了这 4 个用例和纯函数已经覆盖的解码、JWT、host、绑定编码以外，**都还没写**。GitHub Actions 不会解密凭据，也不会把它们变成失败。
+
+`SNOWFLAKE_TEST_REQUIRED=1` 时缺少凭据会 panic。这个开关给想强制跑真实账号的人用。CI 没有设置它。
 
 ### 7.1 环境变量与凭据
 
@@ -500,9 +501,9 @@ Snowflake 返回的 IPC stream 里，字段 metadata 含 `logicalType`、`scale`
 | `SNOWFLAKE_TEST_ROLE` | 是 | |
 | `SNOWFLAKE_TEST_HOST` | 否 | 覆盖默认 host（PrivateLink / 中国区） |
 | `SNOWFLAKE_TEST_PROTOCOL` / `SNOWFLAKE_TEST_PORT` | 否 | 默认 `https` / `443` |
-| `SNOWFLAKE_TEST_REQUIRED` | 否 | 设为 `1` 时（CI），缺少凭据直接 panic，防止“什么都没跑却绿了”；本地未设置时测试打印提示并跳过 |
+| `SNOWFLAKE_TEST_REQUIRED` | 否 | 设为 `1` 时，缺少凭据直接 panic。CI **没有**设置它。未设置时测试打印提示并跳过，过程是成功的 |
 
-凭据文件：`ci/parameters/parameters_{aws,azure,gcp}.json.gpg`，用对称口令加密（`gpg --symmetric --cipher-algo AES256`），口令以 `PARAMETERS_SECRET` 存在 CI secret 中。解密后的 JSON 结构与 gosnowflake 一致：
+`ci/parameters/` 里目前只有这份说明，没有 `parameters_{aws,azure,gcp}.json.gpg`。`ci/scripts/decrypt_parameters.sh` 可以在本地解密一份自己准备的文件，CI 不调用它。若自行准备，明文 JSON 形状如下，且不要提交明文：
 
 ```json
 {
@@ -557,7 +558,9 @@ async fn select_number_scale_3_as_decimal128() {
 
 ### 7.3 覆盖范围
 
-| 领域 | 真实账号上怎么测 |
+下表是目标，不是现状。现状只有 `live.rs` 的 4 个用例，加上各 crate 里不联网的 `#[test]`。类型矩阵、分片下载、轮询、取消、绑定、ADBC driver-manager 集成都没有落地。
+
+| 领域 | 真实账号上打算怎么测 |
 | --- | --- |
 | 认证 | 密码登录成功；错误密码返回 `Error::Auth{code: "390100"}`；（M2）Key-Pair 登录成功、错误私钥返回 `390144` |
 | 会话生命周期 | 登录参数（`TIMEZONE`）被正确读取；`ALTER SESSION SET TIMEZONE` 后下一次查询的 LTZ 列时区随之变化；`close()` 后再查询报错 |
@@ -574,16 +577,16 @@ async fn select_number_scale_3_as_decimal128() {
 
 ### 7.4 CI 流程
 
+`.github/workflows/ci.yml` 实际只有这些步骤，没有 cloud matrix，也没有解密：
+
 ```
-matrix: cloud ∈ {aws, azure, gcp} × rust ∈ {stable, msrv}
-steps:
-  - cargo fmt --check && cargo clippy --all-targets -D warnings
-  - cargo build --workspace
-  - ci/scripts/decrypt_parameters.sh $cloud        # 需要 PARAMETERS_SECRET
-  - SNOWFLAKE_TEST_REQUIRED=1 cargo test --workspace
+cargo fmt --all -- --check
+cargo clippy --workspace --all-targets -- -D warnings
+cargo build --workspace --all-targets
+cargo test --workspace
 ```
 
-来自 fork 的外部 PR 拿不到 secret，只跑 fmt / clippy / build 和纯函数测试；带凭据的全量测试由维护者在主仓库分支上跑。
+因此 CI 绿灯只表示纯函数测试通过，以及那 4 个 live 测试因缺少环境变量被跳过。它不代表连上过 Snowflake。
 
 ---
 
@@ -591,8 +594,8 @@ steps:
 
 | 风险 | 应对 |
 | --- | --- |
-| Arrow 结果格式协商依赖伪装 `CLIENT_APP_ID`，服务端行为可能变化 | 逐查询读 `queryResultFormat`，JSON 解码路径永远可用，退化只影响性能不影响正确性 |
-| Snowflake 新增物理编码（例如新的 `TIMESTAMP` 结构体形态） | 归一化对未知形态直接报错并打印 IPC schema；类型矩阵测试每次 CI 都打真实服务端，能第一时间发现 |
+| Arrow 结果格式协商依赖把 `CLIENT_APP_ID` 伪装成 Go 1.13.3，服务端行为可能变化，最低驱动版本策略也可能直接拒绝登录 | 逐查询读 `queryResultFormat`，JSON 解码路径可用。这个垫片还没有对当前账号验证 |
+| Snowflake 新增物理编码（例如新的 `TIMESTAMP` 结构体形态） | 归一化对未知形态直接报错。类型矩阵还没有在 CI 里打真实服务端 |
 | arrow-rs 与 `adbc_core` 版本错位 | workspace 中由 `adbc_core` 的 arrow 版本反推锁定，CI 加 `cargo tree -d` 检查重复 arrow |
 | 密码认证被 Snowflake 彻底关闭 | 认证层已抽象为 `Authenticator` 枚举，JWT 在 M2 落地；文档明确要求服务账号设为 `TYPE = SERVICE` + Key-Pair |
 | 大结果内存 | 有界预取 channel；Arrow 分片直接零拷贝进 `RecordBatch`，JSON 分片解析后即释放原文 |
@@ -603,7 +606,9 @@ steps:
 
 ## 9. 待首次联调确认的事项
 
-1. 结果格式参数的确切名字与传递位置（`SESSION_PARAMETERS` 还是查询 `parameters`），以及目标账号是否对 Arrow 有账号级限制。
+本节仍然是开放项。没有真实账号跑过这些路径，README 也不应把 Arrow 路径写成已经验证。
+
+1. 结果格式参数的确切名字与传递位置（`SESSION_PARAMETERS` 还是查询 `parameters`），以及目标账号是否对 Arrow 有账号级限制。固定的 `CLIENT_APP_ID=Go` / `CLIENT_APP_VERSION=1.13.3` 是否会被最低驱动版本策略拒绝，同属这一项。
 2. 目标账号中 `LEGACY_SERVICE` 用户的实际可用性（密码登录是否已被策略阻断），决定 M1 验证时是否需要提前引入 JWT。
 3. 当前服务端对 `TIMESTAMP_*` 返回 `Int64` 还是 `Struct` 编码（两者都实现，类型矩阵测试以真实返回为准）。
 4. 测试账号：需要 AWS / Azure / GCP 各一个（至少 AWS + Azure），每个账号一个 `LEGACY_SERVICE` 用户、一个专用测试库和一个小规格 warehouse。
