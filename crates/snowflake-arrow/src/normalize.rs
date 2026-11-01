@@ -569,15 +569,7 @@ fn normalize_timestamp_struct(
     let mut offsets = Vec::with_capacity(struct_array.len());
     for index in 0..struct_array.len() {
         if struct_array.is_null(index) {
-            if epoch.is_valid(index) || fraction.as_ref().is_some_and(|f| f.is_valid(index)) {
-                return Err(Error::decode(
-                    &column.name,
-                    index,
-                    column.logical_type(),
-                    None,
-                    "null timestamp struct has a non-null child",
-                ));
-            }
+            // A null struct slot may still hold child values. Arrow allows that.
             instants.push(None);
             offsets.push(None);
             continue;
@@ -738,21 +730,49 @@ fn normalize_vector(array: &ArrayRef, column: &RowType) -> Result<ArrayRef> {
     let Some(list) = array.as_any().downcast_ref::<FixedSizeListArray>() else {
         return Err(physical_rejected(column, array.data_type()));
     };
-    let expected = column.length.unwrap_or(0);
-    if i64::from(list.value_length()) != expected {
+    let (field, size) = schema::vector_field(column)?;
+    if list.value_length() != size {
         return Err(Error::decode(
             &column.name,
             0,
             "vector",
             None,
             format!(
-                "vector width {} does not match rowtype length {expected}",
-                list.value_length()
+                "vector width {} does not match rowtype length {}",
+                list.value_length(),
+                column.length.unwrap_or(0)
             ),
         ));
     }
-    match list.values().data_type() {
-        DataType::Float32 | DataType::Int32 => Ok(Arc::new(list.clone())),
-        other => Err(physical_rejected(column, other)),
+    let values = list.values();
+    if values.data_type() != field.data_type() {
+        return Err(Error::decode(
+            &column.name,
+            0,
+            "vector",
+            Some(format!("{:?}", values.data_type())),
+            format!(
+                "vector element does not match rowtype ({})",
+                column
+                    .fields
+                    .first()
+                    .map(|field| field.logical_type())
+                    .unwrap_or("real")
+            ),
+        ));
     }
+    // Rebuild so the child field name and nullability match the schema.
+    // RecordBatch::try_new compares those, not just the value type.
+    let rebuilt =
+        FixedSizeListArray::try_new(field, size, Arc::clone(values), list.nulls().cloned())
+            .map_err(|err| {
+                Error::decode(
+                    &column.name,
+                    0,
+                    "vector",
+                    None,
+                    format!("vector list: {err}"),
+                )
+            })?;
+    Ok(Arc::new(rebuilt))
 }

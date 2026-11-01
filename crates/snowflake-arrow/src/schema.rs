@@ -181,7 +181,11 @@ fn timestamp_tz_type(column: &RowType, opts: &ArrowOptions) -> Result<DataType> 
     }
 }
 
-fn vector_type(column: &RowType) -> Result<DataType> {
+/// `(item field, list size)` for a `VECTOR` column.
+///
+/// `rowtype.fields[0].type = fixed` is `VECTOR(INT, n)` and stays `Int32`.
+/// `real`, or a rowtype with no element field, is `Float32`.
+pub fn vector_field(column: &RowType) -> Result<(Arc<Field>, i32)> {
     let Some(length) = column.length.filter(|n| *n > 0) else {
         return Err(Error::decode(
             &column.name,
@@ -200,10 +204,30 @@ fn vector_type(column: &RowType) -> Result<DataType> {
             "vector length does not fit i32",
         )
     })?;
-    Ok(DataType::FixedSizeList(
-        Arc::new(Field::new("item", DataType::Float32, true)),
-        size,
-    ))
+    let element = match column
+        .fields
+        .first()
+        .map(|field| field.logical_type().to_ascii_lowercase())
+        .as_deref()
+    {
+        None | Some("real") | Some("float") | Some("double") => DataType::Float32,
+        Some("fixed") | Some("int") | Some("integer") => DataType::Int32,
+        Some(other) => {
+            return Err(Error::decode(
+                &column.name,
+                0,
+                "vector",
+                Some(other.to_string()),
+                "vector element type is not fixed or real",
+            ));
+        }
+    };
+    Ok((Arc::new(Field::new("item", element, true)), size))
+}
+
+fn vector_type(column: &RowType) -> Result<DataType> {
+    let (field, size) = vector_field(column)?;
+    Ok(DataType::FixedSizeList(field, size))
 }
 
 fn i64_to_u8(value: i64, column: &str, what: &str) -> Result<u8> {

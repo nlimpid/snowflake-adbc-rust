@@ -333,7 +333,7 @@ JSON rowset     ──strict parse per rowtype───────────�
 | `timestamp_tz` | `Timestamp(unit, Some("UTC"))` | Snowflake 每行有独立偏移，Arrow 列只能有一个时区。默认折叠为 UTC 瞬时（与 Go ADBC 一致）；提供选项 `timestamp_tz = Struct` 输出 `Struct{ epoch: Timestamp(unit, UTC), offset_minutes: Int32 }` 保留原始偏移 |
 | `variant` / `object` / `array`（半结构化） | `Utf8` + field metadata `snowflake.logical_type` | 内容是 JSON 文本。结构化类型（`OBJECT(a INT, ...)`、`ARRAY(INT)`）P2 再映射到 `Struct`/`List` |
 | `geography` / `geometry` | `Utf8` + metadata | 输出格式由会话参数 `GEOGRAPHY_OUTPUT_FORMAT` 决定（默认 GeoJSON），驱动不解析 |
-| `vector` | `FixedSizeList(Int32 \| Float32, n)` | P2 |
+| `vector` | `FixedSizeList(Float32, n)`，元素为 `fixed` 时 `FixedSizeList(Int32, n)` | 元素类型看 `rowtype.fields[0].type`（缺省 `real` → Float32）。Arrow 路径重建子字段为 `item`、nullable，和 schema 完全一致。JSON 的 INT 向量保持 `Int32`，不转成 f32 |
 | 其他未知类型 | **错误** `Error::Decode { reason: "unsupported logical type" }` | 不退化为字符串 |
 
 每个 Arrow `Field` 带 metadata：`snowflake.logical_type`、`snowflake.precision`、`snowflake.scale`、`snowflake.length`、`snowflake.byte_length`，以及 `nullable` 来自 `rowtype.nullable`。

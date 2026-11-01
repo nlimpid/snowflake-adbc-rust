@@ -609,28 +609,41 @@ fn with_timezone(array: ArrayRef, tz: &str) -> Result<ArrayRef> {
     Ok(zoned)
 }
 
+enum VectorValues {
+    Float(FixedSizeListBuilder<Float32Builder>),
+    Int(FixedSizeListBuilder<Int32Builder>),
+}
+
 struct VectorDecoder {
     column: RowType,
     size: i32,
-    builder: FixedSizeListBuilder<Float32Builder>,
+    values: VectorValues,
 }
 
 impl VectorDecoder {
     fn new(column: &RowType) -> Result<Self> {
-        let Some(length) = column.length.filter(|n| *n > 0) else {
-            return Err(fail(
-                column,
-                0,
-                None,
-                "vector column has no positive length",
-            ));
+        let (field, size) = schema::vector_field(column)?;
+        let values = match field.data_type() {
+            DataType::Int32 => VectorValues::Int(
+                FixedSizeListBuilder::with_capacity(Int32Builder::new(), size, 0).with_field(field),
+            ),
+            DataType::Float32 => VectorValues::Float(
+                FixedSizeListBuilder::with_capacity(Float32Builder::new(), size, 0)
+                    .with_field(field),
+            ),
+            other => {
+                return Err(fail(
+                    column,
+                    0,
+                    None,
+                    format!("vector element {other:?} is not supported"),
+                ));
+            }
         };
-        let size = i32::try_from(length)
-            .map_err(|_| fail(column, 0, None, "vector length does not fit i32"))?;
         Ok(Self {
             column: column.clone(),
             size,
-            builder: FixedSizeListBuilder::with_capacity(Float32Builder::new(), size, 0),
+            values,
         })
     }
 }
@@ -638,7 +651,10 @@ impl VectorDecoder {
 impl ColumnDecoder for VectorDecoder {
     fn append(&mut self, row: usize, raw: Option<&str>) -> Result<()> {
         let Some(raw) = raw else {
-            self.builder.append(false);
+            match &mut self.values {
+                VectorValues::Float(builder) => builder.append(false),
+                VectorValues::Int(builder) => builder.append(false),
+            }
             return Ok(());
         };
         let value: serde_json::Value = serde_json::from_str(raw).map_err(|err| {
@@ -665,32 +681,63 @@ impl ColumnDecoder for VectorDecoder {
                 format!("vector length is {}, expected {}", items.len(), self.size),
             ));
         }
-        let values = self.builder.values();
-        for item in items {
-            let number = item.as_f64().ok_or_else(|| {
-                fail(
-                    &self.column,
-                    row,
-                    Some(raw),
-                    "vector element is not a number",
-                )
-            })?;
-            if !number.is_finite() || number < f32::MIN as f64 || number > f32::MAX as f64 {
-                return Err(fail(
-                    &self.column,
-                    row,
-                    Some(raw),
-                    "vector element does not fit Float32",
-                ));
+        match &mut self.values {
+            VectorValues::Float(builder) => {
+                let values = builder.values();
+                for item in items {
+                    let number = item.as_f64().ok_or_else(|| {
+                        fail(
+                            &self.column,
+                            row,
+                            Some(raw),
+                            "vector element is not a number",
+                        )
+                    })?;
+                    if !number.is_finite() || number < f32::MIN as f64 || number > f32::MAX as f64 {
+                        return Err(fail(
+                            &self.column,
+                            row,
+                            Some(raw),
+                            "vector element does not fit Float32",
+                        ));
+                    }
+                    values.append_value(number as f32);
+                }
+                builder.append(true);
             }
-            values.append_value(number as f32);
+            VectorValues::Int(builder) => {
+                let values = builder.values();
+                for item in items {
+                    let number = item.as_i64().ok_or_else(|| {
+                        fail(
+                            &self.column,
+                            row,
+                            Some(raw),
+                            "vector element is not an integer",
+                        )
+                    })?;
+                    let number = i32::try_from(number).map_err(|_| {
+                        fail(
+                            &self.column,
+                            row,
+                            Some(raw),
+                            "vector element does not fit Int32",
+                        )
+                    })?;
+                    values.append_value(number);
+                }
+                builder.append(true);
+            }
         }
-        self.builder.append(true);
         Ok(())
     }
 
     fn finish(mut self: Box<Self>) -> Result<ArrayRef> {
-        Ok(Arc::new(self.builder.finish()))
+        let array = match &mut self.values {
+            VectorValues::Float(builder) => Arc::new(builder.finish()) as ArrayRef,
+            VectorValues::Int(builder) => Arc::new(builder.finish()) as ArrayRef,
+        };
+        Ok(array)
     }
 }
 
@@ -813,6 +860,7 @@ mod tests {
             scale,
             length: None,
             byte_length: None,
+            fields: Vec::new(),
         }
     }
 
