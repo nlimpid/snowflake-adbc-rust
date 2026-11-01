@@ -101,7 +101,7 @@ Load `libadbc_driver_snowflake_rs.so` from Python, Go, or C++ with init function
 | `TIMESTAMP_NTZ` | `Timestamp` with unit taken from scale, no zone |
 | `TIMESTAMP_LTZ` | `Timestamp` in the session `TIMEZONE` |
 | `TIMESTAMP_TZ` | `Timestamp` in UTC, or a struct when requested |
-| `VECTOR` | `FixedSizeList(Float32, n)` |
+| `VECTOR(FLOAT, n)` / `VECTOR(INT, n)` | `FixedSizeList(Float32, n)` / `FixedSizeList(Int32, n)` |
 | anything else | error |
 
 ## Not implemented

@@ -138,6 +138,9 @@ pub struct RowType {
     pub length: Option<i64>,
     #[serde(default)]
     pub byte_length: Option<i64>,
+    /// Nested fields. `VECTOR` uses `fields[0].type` (`fixed` or `real`).
+    #[serde(default)]
+    pub fields: Vec<RowType>,
 }
 
 impl RowType {

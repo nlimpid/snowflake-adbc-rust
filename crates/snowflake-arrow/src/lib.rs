@@ -10,8 +10,8 @@ mod schema;
 mod stream;
 
 pub use schema::{
-    data_type_for, field_for, schema_for, timestamp_unit, ArrowOptions, TimestampTzMode,
-    MD_BYTE_LENGTH, MD_LENGTH, MD_LOGICAL_TYPE, MD_PRECISION, MD_SCALE,
+    data_type_for, field_for, schema_for, timestamp_unit, vector_field, ArrowOptions,
+    TimestampTzMode, MD_BYTE_LENGTH, MD_LENGTH, MD_LOGICAL_TYPE, MD_PRECISION, MD_SCALE,
 };
 pub use stream::{
     block_on_runtime, record_batches, record_batches_with, BlockingBatchReader, SharedRuntime,
@@ -57,6 +57,7 @@ mod tests {
             scale: Some(2),
             length: None,
             byte_length: None,
+            fields: Vec::new(),
         }
     }
 
@@ -119,6 +120,7 @@ mod tests {
             scale: Some(9),
             length: None,
             byte_length: None,
+            fields: Vec::new(),
         };
         let epoch = Int64Array::from(vec![1_700_000_000_i64]);
         let fraction = Int32Array::from(vec![123_000_000_i32]);
@@ -160,5 +162,167 @@ mod tests {
             &DataType::Timestamp(TimeUnit::Nanosecond, None)
         );
         assert_eq!(normalized[0], from_json);
+    }
+
+    fn vector_column(element: Option<&str>) -> RowType {
+        let fields = element
+            .map(|logical| RowType {
+                name: "value".into(),
+                database: String::new(),
+                schema: String::new(),
+                table: String::new(),
+                logical_type: logical.into(),
+                nullable: true,
+                precision: None,
+                scale: None,
+                length: None,
+                byte_length: None,
+                fields: Vec::new(),
+            })
+            .into_iter()
+            .collect();
+        RowType {
+            name: "V".into(),
+            database: String::new(),
+            schema: String::new(),
+            table: String::new(),
+            logical_type: "vector".into(),
+            nullable: true,
+            precision: None,
+            scale: None,
+            length: Some(3),
+            byte_length: None,
+            fields,
+        }
+    }
+
+    fn vector_ipc(list: arrow_array::FixedSizeListArray) -> Vec<u8> {
+        let mut metadata = std::collections::HashMap::new();
+        metadata.insert("logicalType".into(), "VECTOR".into());
+        let field = Field::new("V", list.data_type().clone(), true).with_metadata(metadata);
+        let batch =
+            RecordBatch::try_new(Arc::new(Schema::new(vec![field])), vec![Arc::new(list)]).unwrap();
+        ipc_for(&batch)
+    }
+
+    #[test]
+    fn vector_float_field_is_rebuilt_to_the_schema_field() {
+        use arrow_array::{Float32Array, Int32Array};
+        let values = Float32Array::from(vec![Some(1.0), Some(2.5), Some(-3.0)]);
+        let list = arrow_array::FixedSizeListArray::try_new(
+            Arc::new(Field::new("element", DataType::Float32, false)),
+            3,
+            Arc::new(values),
+            None,
+        )
+        .unwrap();
+        let column = vector_column(Some("real"));
+        let normalized = crate::normalize::batches_from_ipc(
+            &vector_ipc(list),
+            std::slice::from_ref(&column),
+            &SessionParameters::default(),
+            &ArrowOptions::default(),
+        )
+        .unwrap();
+        let expected = crate::schema::data_type_for(
+            &column,
+            &SessionParameters::default(),
+            &ArrowOptions::default(),
+        )
+        .unwrap();
+        assert_eq!(normalized[0].column(0).data_type(), &expected);
+        let from_json = crate::json::batch_from_json(
+            std::slice::from_ref(&column),
+            &[vec![Some("[1.0,2.5,-3.0]".into())]],
+            &SessionParameters::default(),
+            &ArrowOptions::default(),
+        )
+        .unwrap();
+        assert_eq!(normalized[0], from_json);
+
+        let ints = Int32Array::from(vec![1, 2, 16_777_217]);
+        let int_list = arrow_array::FixedSizeListArray::try_new(
+            Arc::new(Field::new("value", DataType::Int32, true)),
+            3,
+            Arc::new(ints),
+            None,
+        )
+        .unwrap();
+        let int_column = vector_column(Some("fixed"));
+        let normalized = crate::normalize::batches_from_ipc(
+            &vector_ipc(int_list),
+            std::slice::from_ref(&int_column),
+            &SessionParameters::default(),
+            &ArrowOptions::default(),
+        )
+        .unwrap();
+        let values = normalized[0]
+            .column(0)
+            .as_any()
+            .downcast_ref::<arrow_array::FixedSizeListArray>()
+            .unwrap()
+            .values()
+            .as_any()
+            .downcast_ref::<Int32Array>()
+            .unwrap();
+        assert_eq!(values.value(2), 16_777_217);
+        let from_json = crate::json::batch_from_json(
+            std::slice::from_ref(&int_column),
+            &[vec![Some("[1,2,16777217]".into())]],
+            &SessionParameters::default(),
+            &ArrowOptions::default(),
+        )
+        .unwrap();
+        assert_eq!(normalized[0], from_json);
+    }
+
+    #[test]
+    fn null_struct_timestamp_allows_child_values() {
+        use arrow_array::{Int32Array, StructArray};
+        use arrow_buffer::NullBuffer;
+        use arrow_schema::Fields;
+
+        let column = RowType {
+            name: "T".into(),
+            database: String::new(),
+            schema: String::new(),
+            table: String::new(),
+            logical_type: "timestamp_ntz".into(),
+            nullable: true,
+            precision: Some(0),
+            scale: Some(9),
+            length: None,
+            byte_length: None,
+            fields: Vec::new(),
+        };
+        let epoch = Int64Array::from(vec![Some(1_700_000_000_i64), Some(99)]);
+        let fraction = Int32Array::from(vec![Some(0), Some(5)]);
+        let struct_array = StructArray::try_new(
+            Fields::from(vec![
+                Field::new("epoch", DataType::Int64, true),
+                Field::new("fraction", DataType::Int32, true),
+            ]),
+            vec![Arc::new(epoch), Arc::new(fraction)],
+            Some(NullBuffer::from(vec![true, false])),
+        )
+        .unwrap();
+        let mut metadata = std::collections::HashMap::new();
+        metadata.insert("logicalType".into(), "TIMESTAMP_NTZ".into());
+        metadata.insert("scale".into(), "9".into());
+        let field = Field::new("T", struct_array.data_type().clone(), true).with_metadata(metadata);
+        let batch = RecordBatch::try_new(
+            Arc::new(Schema::new(vec![field])),
+            vec![Arc::new(struct_array)],
+        )
+        .unwrap();
+        let normalized = crate::normalize::batches_from_ipc(
+            &ipc_for(&batch),
+            std::slice::from_ref(&column),
+            &SessionParameters::default(),
+            &ArrowOptions::default(),
+        )
+        .unwrap();
+        assert!(!normalized[0].column(0).is_null(0));
+        assert!(normalized[0].column(0).is_null(1));
     }
 }
