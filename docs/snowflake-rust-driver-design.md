@@ -404,13 +404,13 @@ Snowflake 返回的 IPC stream 里，字段 metadata 含 `logicalType`、`scale`
 
 ### 5.1 选项键
 
-兼容官方 Go ADBC Snowflake 驱动的键名，这样现有用 Go 驱动的 ADBC 调用方（Python `adbc_driver_snowflake`、DuckDB、Ibis 等的配置）能原样迁移：
+接受 Go ADBC Snowflake 驱动的连接键。早期文档里的别名仍然可用：
 
 | 选项 | 说明 |
 | --- | --- |
 | `uri` | `snowflake://user:pass@account/db/schema?warehouse=&role=`，与分字段选项二选一 |
 | `adbc.snowflake.sql.account` | 账号标识 |
-| `adbc.snowflake.sql.uri`（host 覆盖）| PrivateLink / 中国区 |
+| `adbc.snowflake.sql.uri.host` | host 覆盖（PrivateLink / 中国区）。`adbc.snowflake.sql.uri` 仍作为同一选项的别名 |
 | `username` / `password` | 密码认证 |
 | `adbc.snowflake.sql.auth_type` | `auth_snowflake`（默认）/ `auth_jwt` / `auth_pat` / `auth_oauth` |
 | `adbc.snowflake.sql.client_option.jwt_private_key` | 私钥文件路径 |
@@ -418,10 +418,11 @@ Snowflake 返回的 IPC stream 里，字段 metadata 含 `logicalType`、`scale`
 | `adbc.snowflake.sql.client_option.auth_token` | PAT / OAuth token |
 | `adbc.snowflake.sql.db` / `schema` / `warehouse` / `role` | 会话上下文 |
 | `adbc.snowflake.sql.client_option.app_name` | 写入 `CLIENT_ENVIRONMENT.APPLICATION` |
-| `adbc.snowflake.sql.client_option.use_high_precision` | 本驱动默认 `true`（Decimal128）；设为 `false` 时 scale=0 转 `Int64`、否则 `Float64`，仅为兼容 Go 驱动行为，溢出仍报错 |
+| `adbc.snowflake.sql.client_option.use_high_precision` | 默认 `true`（Decimal128）。`false` 时 scale 0 为 `Int64`、其余为 `Float64`，溢出仍报错。Go 驱动默认同样是 `true` |
 | `adbc.snowflake.rs.timestamp_tz` | `utc`（默认）/ `struct` |
-| `adbc.snowflake.sql.client_option.prefetch_concurrency` | 分片并发数 |
-| `adbc.snowflake.sql.client_option.query_timeout` 等 | 超时 |
+| `adbc.snowflake.sql.uri.port` / `adbc.snowflake.sql.uri.protocol` / `adbc.snowflake.sql.region` | 与 Go 驱动相同。`region` 只在没有显式 host、且 account 本身不带 `.` 时拼进 host |
+| `adbc.snowflake.rpc.prefetch_concurrency` | 分片并发。Go 驱动是 statement 级；本驱动在 statement 上设置时只影响该语句，在 database 上设置时成为会话默认。`adbc.snowflake.sql.client_option.prefetch_concurrency` 仍可用 |
+| `adbc.snowflake.sql.client_option.query_timeout` / `login_timeout` | 超时，单位秒 |
 
 ### 5.2 Trait 映射
 
@@ -431,7 +432,7 @@ Snowflake 返回的 IPC stream 里，字段 metadata 含 `logicalType`、`scale`
 | `Database::new_connection` | `client.connect()` → `Session` |
 | `Connection::new_statement` | 空 `Statement` 持有 `Arc<Session>` |
 | `Connection::get_info` | `VENDOR_NAME = "Snowflake"`、`VENDOR_VERSION`（登录响应里的 `serverVersion`）、`DRIVER_NAME/VERSION`、`DRIVER_ARROW_VERSION` |
-| `Connection::get_objects` | 查询 `INFORMATION_SCHEMA`（或 `SHOW TERSE ...`），按 ADBC `GetObjects` 嵌套 schema 组装（catalog → db_schema → table → column） |
+| `Connection::get_objects` | 先查账号级 `information_schema.databases`，再对每个库查 `"<db>".information_schema.schemata/tables/columns`。未限定的 `information_schema.schemata` 只能看到当前库 |
 | `Connection::get_table_schema` | `describeOnly = true` 执行 `SELECT * FROM <table>`，由 `rowtype` 生成 Arrow Schema（与查询结果 Schema 100% 一致） |
 | `Connection::get_table_types` | 静态：`TABLE`, `VIEW`, `TEMPORARY TABLE`, `TRANSIENT TABLE`, `EXTERNAL TABLE`, `DYNAMIC TABLE`, `HYBRID TABLE` |
 | `Connection::commit` / `rollback` | 执行 `COMMIT` / `ROLLBACK`；`autocommit` 选项对应 `ALTER SESSION SET AUTOCOMMIT` |

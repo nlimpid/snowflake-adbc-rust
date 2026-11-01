@@ -231,6 +231,7 @@ impl Connection for SnowflakeConnection {
             parameter_count: None,
             bound: Vec::new(),
             options: HashMap::new(),
+            prefetch: None,
             request_id: StdMutex::new(None),
         })
     }
@@ -336,6 +337,7 @@ pub struct SnowflakeStatement {
     parameter_count: Option<i64>,
     bound: Vec<RecordBatch>,
     options: HashMap<String, String>,
+    prefetch: Option<usize>,
     /// Set only while this statement is inside `run`. Cancel uses it so an idle
     /// statement does not abort another statement's query.
     request_id: StdMutex<Option<String>>,
@@ -360,6 +362,7 @@ impl SnowflakeStatement {
         let binds = binds_from_batches(&self.bound)?;
         let session = self.session.clone();
         let request_id = uuid::Uuid::new_v4().to_string();
+        let prefetch = self.prefetch;
         *self
             .request_id
             .lock()
@@ -369,6 +372,9 @@ impl SnowflakeStatement {
                 .query(sql)
                 .describe_only(describe_only)
                 .request_id(request_id);
+            if let Some(prefetch) = prefetch {
+                query = query.prefetch(prefetch);
+            }
             for bind in binds {
                 query = query.bind(bind);
             }
@@ -397,8 +403,16 @@ impl Optionable for SnowflakeStatement {
                 format!("{} is read-only", key.as_ref()),
             )),
             OptionStatement::Other(name) => {
-                self.options
-                    .insert(name, crate::settings::option_string(&value)?);
+                let text = crate::settings::option_string(&value)?;
+                if name == crate::settings::OPT_PREFETCH
+                    || name == crate::settings::OPT_PREFETCH_LEGACY
+                {
+                    let threads: usize = text
+                        .parse()
+                        .map_err(|err| error::invalid(format!("expected an integer: {err}")))?;
+                    self.prefetch = Some(threads.max(1));
+                }
+                self.options.insert(name, text);
                 Ok(())
             }
             _ => Err(error::not_implemented(key.as_ref())),
@@ -563,6 +577,12 @@ fn runtime_build_error(err: std::io::Error) -> adbc_core::error::Error {
     )
 }
 
+fn date64_to_days(millis: i64) -> Result<i32> {
+    let days = millis.div_euclid(86_400_000);
+    i32::try_from(days)
+        .map_err(|_| error::invalid(format!("date64 value {millis} is outside Date32")))
+}
+
 fn affected_rows(sql: &str, batches: &[RecordBatch]) -> Result<Option<i64>> {
     if let Some(batch) = batches
         .iter()
@@ -694,7 +714,7 @@ fn cell_to_bind(
         }
         arrow_schema::DataType::Date64 => {
             let millis = prim::<arrow_array::types::Date64Type>(array)?.value(row);
-            Bind::Date((millis / 86_400_000) as i32)
+            Bind::Date(date64_to_days(millis)?)
         }
         arrow_schema::DataType::Time32(_) | arrow_schema::DataType::Time64(_) => {
             Bind::Time(time_to_nanos(array, row)?)
@@ -1153,5 +1173,17 @@ mod tests {
         current.block_on(async {
             run();
         });
+    }
+
+    #[test]
+    fn date64_before_epoch_uses_floor_division() {
+        assert_eq!(date64_to_days(0).unwrap(), 0);
+        assert_eq!(date64_to_days(-1).unwrap(), -1);
+        assert_eq!(date64_to_days(-86_400_000).unwrap(), -1);
+        assert_eq!(date64_to_days(86_400_000).unwrap(), 1);
+        assert!(matches!(
+            bound(Arc::new(Date64Array::from(vec![-1_i64]))),
+            Bind::Date(-1)
+        ));
     }
 }

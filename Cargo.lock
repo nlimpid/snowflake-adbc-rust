@@ -1745,6 +1745,7 @@ dependencies = [
  "arrow-buffer",
  "arrow-schema",
  "futures",
+ "percent-encoding",
  "snowflake-arrow",
  "snowflake-core",
  "tokio",
