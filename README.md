@@ -23,7 +23,7 @@ The `publish` workflow uploads the workspace version when a GitHub Release is pu
 | `snowflake-arrow` | `rowtype` → Arrow schema. JSON and Arrow IPC decode to the same schema. Bad cells return `Error::Decode` instead of NULL. |
 | `snowflake-adbc` | `adbc_core` Driver / Database / Connection / Statement. |
 | `snowflake-adbc-ffi` | `libadbc_driver_snowflake_rs` with entry point `SnowflakeDriverInit`. |
-| `snowflake-testing` | Real-account helpers used by `cargo test`. |
+| `snowflake-testing` | Optional real-account helpers. Those tests skip unless `SNOWFLAKE_TEST_*` is set. |
 
 ## Run
 
@@ -32,7 +32,11 @@ cargo test --workspace
 cargo build -p snowflake-adbc-ffi
 ```
 
-Rust 1.99 or newer, matching castor-agent. Arrow is 59.3.1 and reqwest is 0.13.5. Real-account tests skip unless `SNOWFLAKE_TEST_ACCOUNT`, `SNOWFLAKE_TEST_USER`, `SNOWFLAKE_TEST_PASSWORD` (or a private key), `SNOWFLAKE_TEST_WAREHOUSE`, `SNOWFLAKE_TEST_DATABASE`, `SNOWFLAKE_TEST_SCHEMA`, and `SNOWFLAKE_TEST_ROLE` are set. CI decrypts `ci/parameters/parameters_<cloud>.json.gpg` with `PARAMETERS_SECRET` and sets `SNOWFLAKE_TEST_REQUIRED=1`. See [`ci/parameters/README.md`](ci/parameters/README.md).
+Rust 1.99 or newer. Arrow is 59.3.1 and reqwest is 0.13.5.
+
+`cargo test` does not contact Snowflake unless `SNOWFLAKE_TEST_ACCOUNT`, `SNOWFLAKE_TEST_USER`, `SNOWFLAKE_TEST_PASSWORD` (or a private key), `SNOWFLAKE_TEST_WAREHOUSE`, `SNOWFLAKE_TEST_DATABASE`, `SNOWFLAKE_TEST_SCHEMA`, and `SNOWFLAKE_TEST_ROLE` are set. The four tests in `crates/snowflake-testing/src/live.rs` then log in; otherwise they print a skip line and pass. GitHub Actions runs fmt, clippy, build, and `cargo test` only. It does not decrypt credentials and does not set `SNOWFLAKE_TEST_REQUIRED`. A green CI run means the unit tests passed. See [`ci/parameters/README.md`](ci/parameters/README.md).
+
+Arrow IPC normalization, SSE-C chunk download, long-query polling, and cancel have not been confirmed against a live account. Design doc section 9 is still open.
 
 Password login needs a `LEGACY_SERVICE` user. Key-pair JWT is `Authenticator::key_pair_from_pem`.
 
@@ -67,7 +71,7 @@ session.close().await?;
 ## ADBC
 
 ```rust
-use adbc_core::{Connection, Database, Driver};
+use adbc_core::{Connection, Database, Driver, Statement};
 use adbc_core::options::{OptionDatabase, OptionValue};
 use snowflake_adbc::SnowflakeDriver;
 
@@ -83,7 +87,9 @@ statement.set_sql_query("select 1")?;
 let reader = statement.execute()?;
 ```
 
-`NUMBER(p, s)` is `Decimal128(p, s)`. Set `adbc.snowflake.sql.client_option.use_high_precision` to `false` for the Go driver's int64/float64 behavior. `adbc.snowflake.rs.timestamp_tz=struct` keeps each `TIMESTAMP_TZ` offset.
+`NUMBER(p, s)` is `Decimal128(p, s)`. Set `adbc.snowflake.sql.client_option.use_high_precision` to `false` to decode scale 0 as `Int64` and any other scale as `Float64` (values that do not fit still error). The Go ADBC driver defaults this option to `true` as well; `false` is the lossy mode in both drivers. `adbc.snowflake.rs.timestamp_tz=struct` keeps each `TIMESTAMP_TZ` offset.
+
+Login sends `CLIENT_APP_ID=Go` and `CLIENT_APP_VERSION=1.13.3` so Snowflake will honor `GO_QUERY_RESULT_FORMAT=ARROW`. `app_name` is only `CLIENT_ENVIRONMENT.APPLICATION`. That version is a fixed compatibility pin, not this crate's version, and Snowflake's minimum driver version policy can reject it. This has not been checked against a current account.
 
 Load `libadbc_driver_snowflake_rs.so` from Python, Go, or C++ with init function `SnowflakeDriverInit`.
 

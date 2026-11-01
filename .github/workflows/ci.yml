@@ -9,6 +9,7 @@ jobs:
   ci:
     runs-on: ubuntu-latest
     steps:
+      # No credential decrypt and no SNOWFLAKE_TEST_REQUIRED. Live tests skip.
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
         with:

@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Decrypt ci/parameters/parameters_<cloud>.json.gpg and print `export` lines.
-# Source the output so the variables land in the current shell:
+# GitHub Actions does not run this script. Source the output locally:
 #
 #   source ci/scripts/decrypt_parameters.sh aws
 #

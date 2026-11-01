@@ -1,6 +1,8 @@
 # Test account parameters
 
-Real-account tests read `SNOWFLAKE_TEST_*` from the environment. CI decrypts one file per cloud:
+Real-account tests read `SNOWFLAKE_TEST_*` from the environment. Nothing in this directory is encrypted, and GitHub Actions does not decrypt credentials. `cargo test` skips `crates/snowflake-testing/src/live.rs` when the variables are unset and still exits 0.
+
+To run those four tests locally, export the variables yourself. The layout below is only for someone who wants to keep a passphrase-encrypted copy next to the repo. `ci/scripts/decrypt_parameters.sh` reads that copy; CI never calls it.
 
 - `parameters_aws.json.gpg`
 - `parameters_azure.json.gpg`
