@@ -27,3 +27,4 @@ snowflake-arrow.workspace = true
 snowflake-core.workspace = true
 tokio.workspace = true
 url.workspace = true
+uuid.workspace = true

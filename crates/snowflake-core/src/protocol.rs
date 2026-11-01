@@ -366,6 +366,20 @@ pub fn parse_json_chunk(bytes: &[u8]) -> Result<Vec<Vec<Option<String>>>> {
     parse_rowset_value(&value)
 }
 
+/// Database, schema, warehouse, and role echoed by login.
+#[derive(Debug, Clone, Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct SessionInfo {
+    #[serde(default)]
+    pub database_name: Option<String>,
+    #[serde(default)]
+    pub schema_name: Option<String>,
+    #[serde(default)]
+    pub warehouse_name: Option<String>,
+    #[serde(default)]
+    pub role_name: Option<String>,
+}
+
 #[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "camelCase")]
 #[allow(dead_code)]
@@ -381,6 +395,8 @@ pub struct LoginData {
     pub server_version: Option<String>,
     #[serde(default)]
     pub parameters: Vec<NameValue>,
+    #[serde(default)]
+    pub session_info: Option<SessionInfo>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -426,6 +442,19 @@ mod tests {
 
         let rows = parse_json_chunk(br#"[["only"]]"#).unwrap();
         assert_eq!(rows, vec![vec![Some("only".into())]]);
+    }
+
+    #[test]
+    fn login_data_reads_session_info() {
+        let data: LoginData = serde_json::from_str(
+            r#"{"token":"t","masterToken":"m","validityInSeconds":60,"sessionInfo":{"databaseName":"DB","schemaName":"PUBLIC","warehouseName":"WH","roleName":"R"}}"#,
+        )
+        .unwrap();
+        let info = data.session_info.expect("sessionInfo");
+        assert_eq!(info.database_name.as_deref(), Some("DB"));
+        assert_eq!(info.schema_name.as_deref(), Some("PUBLIC"));
+        assert_eq!(info.warehouse_name.as_deref(), Some("WH"));
+        assert_eq!(info.role_name.as_deref(), Some("R"));
     }
 
     #[test]

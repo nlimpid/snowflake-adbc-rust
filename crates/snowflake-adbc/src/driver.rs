@@ -1,7 +1,7 @@
 //! ADBC Driver, Database, Connection, and Statement.
 
 use std::collections::HashMap;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex as StdMutex};
 
 use adbc_core::error::Result;
 use adbc_core::options::{
@@ -231,6 +231,7 @@ impl Connection for SnowflakeConnection {
             parameter_count: None,
             bound: Vec::new(),
             options: HashMap::new(),
+            request_id: StdMutex::new(None),
         })
     }
 
@@ -335,6 +336,9 @@ pub struct SnowflakeStatement {
     parameter_count: Option<i64>,
     bound: Vec<RecordBatch>,
     options: HashMap<String, String>,
+    /// Set only while this statement is inside `run`. Cancel uses it so an idle
+    /// statement does not abort another statement's query.
+    request_id: StdMutex<Option<String>>,
 }
 
 impl SnowflakeStatement {
@@ -355,13 +359,26 @@ impl SnowflakeStatement {
         let sql = self.sql()?.to_string();
         let binds = binds_from_batches(&self.bound)?;
         let session = self.session.clone();
-        self.block(async move {
-            let mut query = session.query(sql).describe_only(describe_only);
+        let request_id = uuid::Uuid::new_v4().to_string();
+        *self
+            .request_id
+            .lock()
+            .unwrap_or_else(|err| err.into_inner()) = Some(request_id.clone());
+        let result = self.block(async move {
+            let mut query = session
+                .query(sql)
+                .describe_only(describe_only)
+                .request_id(request_id);
             for bind in binds {
                 query = query.bind(bind);
             }
             query.execute().await
-        })
+        });
+        *self
+            .request_id
+            .lock()
+            .unwrap_or_else(|err| err.into_inner()) = None;
+        result
     }
 }
 
@@ -512,7 +529,15 @@ impl Statement for SnowflakeStatement {
     }
 
     fn cancel(&mut self) -> Result<()> {
-        self.block(self.session.cancel())
+        let request_id = self
+            .request_id
+            .lock()
+            .unwrap_or_else(|err| err.into_inner())
+            .clone();
+        match request_id {
+            Some(request_id) => self.block(self.session.cancel_request(&request_id)),
+            None => Ok(()),
+        }
     }
 }
 

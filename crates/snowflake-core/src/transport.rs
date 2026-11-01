@@ -28,7 +28,13 @@ pub struct JsonRequest<'a> {
     pub retry_budget: Duration,
     /// Kept stable across HTTP retries so Snowflake can deduplicate the request.
     pub request_id: Option<String>,
+    /// Rebuilt at the start of every attempt. Login uses this so a key-pair JWT,
+    /// whose `exp` is 60 seconds, is signed again instead of being retried stale.
+    pub body_factory: Option<BodyFactory>,
 }
+
+/// Builds a request body for one HTTP attempt.
+pub type BodyFactory = Box<dyn Fn() -> Result<Value> + Send + Sync>;
 
 pub async fn send_json(
     client: &reqwest::Client,
@@ -51,7 +57,21 @@ pub async fn send_json(
             .saturating_sub(started.elapsed())
             .max(Duration::from_millis(1));
         let timeout = request.attempt_timeout.min(remaining);
-        match send_once(client, base, &request, &request_id, attempt, timeout).await {
+        let body = match &request.body_factory {
+            Some(factory) => Some(factory()?),
+            None => request.body.clone(),
+        };
+        match send_once(
+            client,
+            base,
+            &request,
+            body.as_ref(),
+            &request_id,
+            attempt,
+            timeout,
+        )
+        .await
+        {
             Ok(envelope) => return Ok(envelope),
             Err(err) if err_is_retryable(&err) && started.elapsed() < request.retry_budget => {
                 tracing::debug!(attempt, %err, "retrying snowflake request");
@@ -68,6 +88,7 @@ async fn send_once(
     client: &reqwest::Client,
     base: &Url,
     request: &JsonRequest<'_>,
+    body: Option<&Value>,
     request_id: &str,
     attempt: u32,
     timeout: Duration,
@@ -85,7 +106,7 @@ async fn send_once(
     } {
         builder = builder.header("Authorization", format!("Snowflake Token=\"{token}\""));
     }
-    if let Some(body) = &request.body {
+    if let Some(body) = body {
         builder = builder.json(body);
     }
     let response = builder.send().await?;

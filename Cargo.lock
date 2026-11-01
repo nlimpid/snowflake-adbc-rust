@@ -1749,6 +1749,7 @@ dependencies = [
  "snowflake-core",
  "tokio",
  "url",
+ "uuid",
 ]
 
 [[package]]
