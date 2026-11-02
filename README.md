@@ -89,6 +89,8 @@ let reader = statement.execute()?;
 
 `NUMBER(p, s)` is `Decimal128(p, s)`. Set `adbc.snowflake.sql.client_option.use_high_precision` to `false` to decode scale 0 as `Int64` and any other scale as `Float64` (values that do not fit still error). The Go ADBC driver defaults this option to `true` as well; `false` is the lossy mode in both drivers. `adbc.snowflake.rs.timestamp_tz=struct` keeps each `TIMESTAMP_TZ` offset.
 
+Failures are [`snowflake_core::Error`], shaped like OpenDAL's error: match [`ErrorKind`](https://docs.rs/snowflake-core), read `message()`, and attach context with `with_context`. The source is an `anyhow::Error`. `is_temporary()` means the same call may be retried. `Debug` prints context and a captured backtrace, and does not print passwords or tokens.
+
 Login sends `CLIENT_APP_ID=Go` and `CLIENT_APP_VERSION=1.13.3` so Snowflake will honor `GO_QUERY_RESULT_FORMAT=ARROW`. `app_name` is only `CLIENT_ENVIRONMENT.APPLICATION`. That version is a fixed compatibility pin, not this crate's version, and Snowflake's minimum driver version policy can reject it. This has not been checked against a current account.
 
 Load `libadbc_driver_snowflake_rs.so` from Python, Go, or C++ with init function `SnowflakeDriverInit`.

@@ -11,14 +11,20 @@ use crate::protocol::{self, RawChunk, RowType, SessionParameters};
 use crate::transport;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// How Snowflake encoded this result.
 pub enum ResultFormat {
+    /// Arrow IPC.
     Arrow,
+    /// JSON rows.
     Json,
 }
 
+/// One downloaded chunk, still in the format Snowflake sent.
 #[derive(Debug, Clone)]
 pub enum ResultChunk {
+    /// JSON rows.
     Json(Vec<Vec<Option<String>>>),
+    /// Raw Arrow IPC bytes.
     ArrowIpc(Bytes),
 }
 
@@ -114,46 +120,57 @@ impl QueryResult {
         }
     }
 
+    /// Snowflake query id. Empty when the server did not send one.
     pub fn query_id(&self) -> &str {
         &self.query_id
     }
 
+    /// Result format negotiated for this statement.
     pub fn format(&self) -> ResultFormat {
         self.format
     }
 
+    /// Column metadata from `rowtype`.
     pub fn row_type(&self) -> &[RowType] {
         &self.row_type
     }
 
+    /// Rows Snowflake reported for the statement.
     pub fn total_rows(&self) -> i64 {
         self.total_rows
     }
 
+    /// Rows in the inline first chunk.
     pub fn returned_rows(&self) -> i64 {
         self.returned_rows
     }
 
+    /// Snowflake statement type id, when the server sent one.
     pub fn statement_type_id(&self) -> Option<i64> {
         self.statement_type_id
     }
 
+    /// Bind count Snowflake reported.
     pub fn number_of_binds(&self) -> i64 {
         self.number_of_binds
     }
 
+    /// SQLSTATE, when the server sent one.
     pub fn sql_state(&self) -> Option<&str> {
         self.sql_state.as_deref()
     }
 
+    /// Result ids for a multi-statement response.
     pub fn result_ids(&self) -> &[String] {
         &self.result_ids
     }
 
+    /// Session parameters attached to this response.
     pub fn parameters(&self) -> &SessionParameters {
         &self.parameters
     }
 
+    /// The statement is still running. Call [`Session::fetch_result`](crate::Session::fetch_result).
     pub fn is_pending(&self) -> bool {
         self.pending
     }
@@ -169,6 +186,7 @@ impl QueryResult {
         self.chunks.len()
     }
 
+    /// Inline first chunk, then the remaining chunks in order.
     pub fn into_chunk_stream(self) -> Pin<Box<dyn Stream<Item = Result<ResultChunk>> + Send>> {
         let pending = self.pending;
         let initial = if pending {

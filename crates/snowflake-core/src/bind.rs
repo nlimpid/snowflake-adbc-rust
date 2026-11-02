@@ -7,10 +7,15 @@ use crate::error::{Error, Result};
 /// One bound value, or an array binding for a bulk insert.
 #[derive(Clone, Debug)]
 pub enum Bind {
+    /// SQL NULL.
     Null,
+    /// `TEXT`. The value is sent as written.
     Text(String),
+    /// `FIXED`. Send a decimal string, not a native integer.
     Fixed(String),
+    /// `REAL`. Send a decimal string. `inf`, `-inf`, and `NaN` are accepted.
     Real(String),
+    /// `BOOLEAN`.
     Boolean(bool),
     /// Days since Unix epoch. Encoded as milliseconds, which is what Snowflake expects for `DATE`.
     Date(i32),
@@ -22,15 +27,19 @@ pub enum Bind {
     TimestampLtz(i64),
     /// Nanoseconds since Unix epoch plus the original offset in minutes.
     TimestampTz {
+        /// Nanoseconds since the Unix epoch.
         nanos: i64,
+        /// Original offset in minutes.
         offset_minutes: i32,
     },
+    /// `BINARY`. Encoded as hex.
     Binary(Vec<u8>),
     /// Array binding. Every element must be the same scalar kind (or [`Bind::Null`]).
     Array(Vec<Bind>),
 }
 
 impl Bind {
+    /// Encode this value as one Snowflake binding object.
     pub fn to_binding(&self) -> Result<Value> {
         match self {
             Self::Array(items) => encode_array(items),

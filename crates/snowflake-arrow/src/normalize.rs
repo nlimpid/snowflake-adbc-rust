@@ -126,11 +126,18 @@ fn normalize_column(
 }
 
 fn annotate(err: Error, column: &RowType) -> Error {
-    match err {
-        Error::Protocol(reason) => {
+    match err.kind() {
+        snowflake_core::ErrorKind::Protocol => {
+            // `message()` includes the "protocol error: " prefix. The decode
+            // reason is the text after that prefix, which is what callers saw
+            // when `Error` was an enum.
+            let reason = err
+                .message()
+                .strip_prefix("protocol error: ")
+                .unwrap_or(err.message());
             Error::decode(&column.name, 0, column.logical_type(), None, reason)
         }
-        other => other,
+        _ => err,
     }
 }
 

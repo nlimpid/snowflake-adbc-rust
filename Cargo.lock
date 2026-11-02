@@ -64,6 +64,12 @@ dependencies = [
 ]
 
 [[package]]
+name = "anyhow"
+version = "1.0.104"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "330a5ed07fa54e4702c9d6c4174f74427fc0ef6e214bbd677ae50a5099946470"
+
+[[package]]
 name = "arrow-array"
 version = "59.3.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1780,6 +1786,7 @@ dependencies = [
 name = "snowflake-core"
 version = "0.1.0"
 dependencies = [
+ "anyhow",
  "base64 0.22.1",
  "bytes",
  "futures",
@@ -1790,7 +1797,6 @@ dependencies = [
  "serde",
  "serde_json",
  "sha2",
- "thiserror",
  "tokio",
  "tracing",
  "url",

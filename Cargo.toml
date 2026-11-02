@@ -21,6 +21,7 @@ categories = ["database", "api-bindings"]
 
 [workspace.dependencies]
 adbc_core = "0.24"
+anyhow = "1"
 async-stream = "0.3"
 adbc_driver_manager = "0.24"
 adbc_ffi = "0.24"
@@ -41,7 +42,6 @@ snowflake-adbc = { version = "0.1.0", path = "crates/snowflake-adbc" }
 snowflake-arrow = { version = "0.1.0", path = "crates/snowflake-arrow" }
 snowflake-core = { version = "0.1.0", path = "crates/snowflake-core" }
 snowflake-testing = { version = "0.1.0", path = "crates/snowflake-testing" }
-thiserror = "2"
 tokio = { version = "=1.54.1", features = ["macros", "rt-multi-thread", "sync", "time"] }
 tracing = "=0.1.44"
 url = "2"

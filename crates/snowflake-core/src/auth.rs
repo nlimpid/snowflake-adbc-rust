@@ -15,10 +15,12 @@ use crate::error::{Error, Result};
 pub struct SecretString(String);
 
 impl SecretString {
+    /// Wrap `value`. `Debug` prints `SecretString(***)`.
     pub fn new(value: impl Into<String>) -> Self {
         Self(value.into())
     }
 
+    /// Borrow the secret. Do not log the result.
     pub fn expose(&self) -> &str {
         &self.0
     }
@@ -33,17 +35,26 @@ impl std::fmt::Debug for SecretString {
 /// How to obtain a Snowflake session.
 #[derive(Clone)]
 pub enum Authenticator {
+    /// Password login. The user must be `LEGACY_SERVICE`.
     Password {
+        /// Password. Not printed by `Debug`.
         password: SecretString,
     },
+    /// Key-pair JWT. The token is signed at each login attempt.
     KeyPair {
+        /// RSA private key. Not printed by `Debug`.
         private_key: Box<RsaPrivateKey>,
+        /// `SHA256:` fingerprint registered for the user.
         public_key_fingerprint: String,
     },
+    /// Programmatic access token.
     ProgrammaticAccessToken {
+        /// Token. Not printed by `Debug`.
         token: SecretString,
     },
+    /// OAuth access token.
     OAuth {
+        /// Token. Not printed by `Debug`.
         token: SecretString,
     },
 }
@@ -67,30 +78,37 @@ impl std::fmt::Debug for Authenticator {
 
 /// Fields placed on the login request for one attempt.
 pub struct LoginMaterial {
+    /// Authenticator name sent on the login request.
     pub authenticator: &'static str,
+    /// Password field. Set only for password login.
     pub password: Option<String>,
+    /// Token field. Set for JWT, programmatic access token, and OAuth.
     pub token: Option<String>,
 }
 
 impl Authenticator {
+    /// Password login.
     pub fn password(password: impl Into<String>) -> Self {
         Self::Password {
             password: SecretString::new(password),
         }
     }
 
+    /// Programmatic access token login.
     pub fn programmatic_access_token(token: impl Into<String>) -> Self {
         Self::ProgrammaticAccessToken {
             token: SecretString::new(token),
         }
     }
 
+    /// OAuth access token login.
     pub fn oauth(token: impl Into<String>) -> Self {
         Self::OAuth {
             token: SecretString::new(token),
         }
     }
 
+    /// Load an RSA private key from PEM. `passphrase` decrypts an encrypted key.
     pub fn key_pair_from_pem(pem: &str, passphrase: Option<&str>) -> Result<Self> {
         let private_key = load_private_key(pem, passphrase)?;
         let public_key_fingerprint = public_key_fingerprint(&private_key)?;
@@ -100,6 +118,7 @@ impl Authenticator {
         })
     }
 
+    /// Load an RSA private key from a PEM file.
     pub fn key_pair_from_path(
         path: impl AsRef<std::path::Path>,
         passphrase: Option<&str>,
@@ -113,6 +132,7 @@ impl Authenticator {
         Self::key_pair_from_pem(&pem, passphrase)
     }
 
+    /// Build the login fields for one attempt. A JWT is signed here, not at construction.
     pub fn login_material(&self, account: &str, user: &str) -> Result<LoginMaterial> {
         match self {
             Self::Password { password } => Ok(LoginMaterial {
@@ -144,6 +164,7 @@ impl Authenticator {
         }
     }
 
+    /// Public key fingerprint, when this is key-pair authentication.
     pub fn fingerprint(&self) -> Option<&str> {
         match self {
             Self::KeyPair {
@@ -164,10 +185,12 @@ pub fn normalize_jwt_account(account: &str) -> String {
     head.to_ascii_uppercase()
 }
 
+/// User name as Snowflake expects it inside a JWT: trimmed and uppercased.
 pub fn normalize_jwt_user(user: &str) -> String {
     user.trim().to_ascii_uppercase()
 }
 
+/// `SHA256:` fingerprint Snowflake compares with the user's registered public key.
 pub fn public_key_fingerprint(key: &RsaPrivateKey) -> Result<String> {
     let public = RsaPublicKey::from(key);
     let der = public
