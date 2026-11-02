@@ -12,6 +12,7 @@ pub struct SnowflakeClient {
 }
 
 impl SnowflakeClient {
+    /// Builder.
     pub fn builder() -> ClientBuilder {
         ClientBuilder::new()
     }
@@ -25,10 +26,12 @@ impl SnowflakeClient {
         Ok(Self { config, http })
     }
 
+    /// Log in and return a session.
     pub async fn connect(&self) -> Result<Session> {
         Session::login(self.http.clone(), self.config.clone()).await
     }
 
+    /// Settings used for this client.
     pub fn config(&self) -> &ClientConfig {
         &self.config
     }

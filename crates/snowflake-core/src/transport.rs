@@ -1,5 +1,6 @@
 //! HTTP calls against the Snowflake SQL API, with the driver's retry rules.
 
+use std::error::Error as StdError;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use reqwest::Method;
@@ -44,7 +45,7 @@ pub async fn send_json(
     let mut delay = Duration::from_secs(1);
     loop {
         if started.elapsed() > request.retry_budget {
-            return Err(Error::Timeout);
+            return Err(Error::timeout());
         }
         let remaining = request
             .retry_budget
@@ -92,25 +93,24 @@ async fn send_once(
     let status = response.status();
     let bytes = response.bytes().await?;
     if status.as_u16() == 429 || status.as_u16() == 408 || status.is_server_error() {
-        return Err(Error::HttpStatus {
-            status: status.as_u16(),
-            body: truncate(&bytes),
-        });
+        return Err(Error::http_status(status.as_u16(), truncate(&bytes)));
     }
     if !status.is_success() {
-        return Err(Error::HttpStatus {
-            status: status.as_u16(),
-            body: truncate(&bytes),
-        });
+        return Err(Error::http_status(status.as_u16(), truncate(&bytes)));
     }
     Envelope::parse(&bytes)
 }
 
 fn err_is_retryable(err: &Error) -> bool {
-    match err {
-        Error::Http(err) => err.is_timeout() || err.is_connect() || err.is_request(),
-        Error::HttpStatus { status, .. } => *status == 429 || *status == 408 || *status >= 500,
-        Error::Timeout => true,
+    match err.kind() {
+        crate::error::ErrorKind::Http => err
+            .source()
+            .and_then(|source| source.downcast_ref::<reqwest::Error>())
+            .is_some_and(|http| http.is_timeout() || http.is_connect() || http.is_request()),
+        crate::error::ErrorKind::HttpStatus => err
+            .status()
+            .is_some_and(|status| status == 429 || status == 408 || status >= 500),
+        crate::error::ErrorKind::Timeout => true,
         _ => false,
     }
 }
@@ -197,10 +197,7 @@ async fn download_once(
     let status = response.status();
     let bytes = response.bytes().await?.to_vec();
     if !status.is_success() {
-        return Err(Error::HttpStatus {
-            status: status.as_u16(),
-            body: truncate(&bytes),
-        });
+        return Err(Error::http_status(status.as_u16(), truncate(&bytes)));
     }
     Ok(bytes)
 }

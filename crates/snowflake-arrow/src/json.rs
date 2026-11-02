@@ -884,15 +884,10 @@ mod tests {
             .unwrap();
         assert_eq!(array.value(0), 12340);
         let err = one(column("v", "fixed", Some(10), Some(2)), Some("123.456")).unwrap_err();
-        let Error::Decode {
-            column, row, raw, ..
-        } = err
-        else {
-            panic!("expected decode error");
-        };
-        assert_eq!(column, "v");
-        assert_eq!(row, 0);
-        assert_eq!(raw.as_deref(), Some("123.456"));
+        assert_eq!(err.kind(), snowflake_core::ErrorKind::Decode);
+        assert_eq!(err.column(), Some("v"));
+        assert_eq!(err.row(), Some(0));
+        assert_eq!(err.raw(), Some("123.456"));
     }
 
     #[test]
@@ -904,7 +899,7 @@ mod tests {
         ];
         for (column, raw) in cases {
             let err = one(column, Some(raw)).unwrap_err();
-            assert!(matches!(err, Error::Decode { .. }), "{err}");
+            assert_eq!(err.kind(), snowflake_core::ErrorKind::Decode, "{err}");
             assert!(err.to_string().contains(raw));
         }
     }
@@ -943,7 +938,7 @@ mod tests {
             Some("999999999999999.0"),
         )
         .unwrap_err();
-        assert!(matches!(err, Error::Decode { .. }), "{err}");
+        assert_eq!(err.kind(), snowflake_core::ErrorKind::Decode, "{err}");
     }
 
     #[test]

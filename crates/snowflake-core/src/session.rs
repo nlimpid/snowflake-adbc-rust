@@ -14,7 +14,7 @@ use url::Url;
 
 use crate::bind::{self, Bind};
 use crate::config::{ClientConfig, GOSNOWFLAKE_APP_ID, GOSNOWFLAKE_COMPAT_VERSION};
-use crate::error::{self, Error, Result};
+use crate::error::{self, Error, ErrorKind, Result};
 use crate::protocol::{self, LoginData, QueryData, RenewData, SessionParameters};
 use crate::result::{QueryResult, ResultFormat};
 use crate::transport::{self, JsonRequest, TokenKind};
@@ -146,6 +146,7 @@ impl Session {
         Ok(session)
     }
 
+    /// Start a statement. Nothing is sent until [`Query::execute`].
     pub fn query(&self, sql: impl Into<String>) -> Query<'_> {
         Query {
             session: self,
@@ -157,34 +158,42 @@ impl Session {
         }
     }
 
+    /// Session parameters last seen on a response.
     pub fn parameters(&self) -> SessionParameters {
         read_lock(&self.inner.state).parameters.clone()
     }
 
+    /// Server version from the login response.
     pub fn server_version(&self) -> String {
         read_lock(&self.inner.state).server_version.clone()
     }
 
+    /// Session id from the login response.
     pub fn session_id(&self) -> Option<i64> {
         read_lock(&self.inner.state).session_id
     }
 
+    /// Current database, after a `USE` or a query response updated it.
     pub fn database(&self) -> Option<String> {
         read_lock(&self.inner.state).database.clone()
     }
 
+    /// Current schema, after a `USE` or a query response updated it.
     pub fn schema_name(&self) -> Option<String> {
         read_lock(&self.inner.state).schema.clone()
     }
 
+    /// Current warehouse, after a `USE` or a query response updated it.
     pub fn warehouse(&self) -> Option<String> {
         read_lock(&self.inner.state).warehouse.clone()
     }
 
+    /// Current role, after a `USE` or a query response updated it.
     pub fn role(&self) -> Option<String> {
         read_lock(&self.inner.state).role.clone()
     }
 
+    /// Ask the monitoring endpoint whether `query_id` is still running.
     pub async fn get_query_status(&self, query_id: &str) -> Result<QueryStatus> {
         self.ensure_open()?;
         let path = format!("monitoring/queries/{query_id}");
@@ -206,6 +215,7 @@ impl Session {
         Ok(QueryStatus::parse(status))
     }
 
+    /// Download the result of a statement that was still running.
     pub async fn fetch_result(&self, query_id: &str) -> Result<QueryResult> {
         self.ensure_open()?;
         let path = format!("queries/{query_id}/result");
@@ -216,12 +226,14 @@ impl Session {
         result
     }
 
+    /// Abort the in-flight statement, if there is one.
     pub async fn cancel(&self) -> Result<()> {
         self.inner.cancel_generation.fetch_add(1, Ordering::SeqCst);
         self.inner.cancel_notify.notify_waiters();
         self.abort_inflight().await
     }
 
+    /// Log out and stop the heartbeat. Further queries fail.
     pub async fn close(&self) -> Result<()> {
         if self.inner.closed.swap(true, Ordering::SeqCst) {
             return Ok(());
@@ -516,7 +528,7 @@ impl Session {
             let envelope = tokio::select! {
                 result = send => result?,
                 _ = self.wait_cancel(generation) => {
-                    return Err(Error::Cancelled);
+                    return Err(Error::cancelled());
                 }
             };
             if envelope.success
@@ -547,7 +559,7 @@ impl Session {
         let _guard = self.inner.renew_lock.lock().await;
         match self.renew_locked().await {
             Ok(()) => Ok(()),
-            Err(Error::SessionExpired) => self.login_locked().await,
+            Err(err) if err.kind() == ErrorKind::SessionExpired => self.login_locked().await,
             Err(err) => Err(err),
         }
     }
@@ -584,7 +596,7 @@ impl Session {
         if !envelope.success {
             let code = envelope.code.clone().unwrap_or_default();
             if Error::is_master_expired(&code) || Error::is_session_expired(&code) {
-                return Err(Error::SessionExpired);
+                return Err(Error::session_expired());
             }
             return Err(error_from_envelope(&envelope));
         }
@@ -622,8 +634,8 @@ impl Session {
         .await?;
         if !envelope.success {
             let err = error_from_envelope(&envelope);
-            if matches!(err, Error::Auth { .. }) {
-                return Err(Error::SessionExpired);
+            if err.kind() == ErrorKind::Auth {
+                return Err(Error::session_expired());
             }
             return Err(err);
         }
@@ -730,7 +742,7 @@ impl Session {
 
     fn ensure_generation(&self, generation: u64) -> Result<()> {
         if self.inner.cancel_generation.load(Ordering::SeqCst) != generation {
-            Err(Error::Cancelled)
+            Err(Error::cancelled())
         } else {
             Ok(())
         }
@@ -749,7 +761,7 @@ impl Session {
     async fn sleep_or_cancel(&self, delay: Duration, generation: u64) -> Result<()> {
         tokio::select! {
             _ = tokio::time::sleep(delay) => self.ensure_generation(generation),
-            _ = self.wait_cancel(generation) => Err(Error::Cancelled),
+            _ = self.wait_cancel(generation) => Err(Error::cancelled()),
         }
     }
 }
@@ -836,17 +848,12 @@ fn error_from_envelope(envelope: &protocol::Envelope) -> Error {
         } else {
             server_message
         };
-        return Error::Auth { code, message };
+        return Error::auth(code, message);
     }
     if code.is_empty() {
         return Error::protocol(format!("request failed: {server_message}"));
     }
-    Error::Server {
-        code,
-        message: server_message,
-        sql_state,
-        query_id,
-    }
+    Error::server(code, server_message, sql_state, query_id)
 }
 
 fn decode_rowset_base64(value: Option<&str>) -> Result<Option<Bytes>> {
@@ -873,7 +880,7 @@ fn retry_budget(config: &ClientConfig, deadline: Option<Instant>) -> Result<Dura
     if let Some(deadline) = deadline {
         let now = Instant::now();
         if now >= deadline {
-            return Err(Error::Timeout);
+            return Err(Error::timeout());
         }
         budget = budget.min(deadline.saturating_duration_since(now));
     }
@@ -885,7 +892,7 @@ fn attempt_timeout(config: &ClientConfig, deadline: Option<Instant>) -> Result<D
     if let Some(deadline) = deadline {
         let now = Instant::now();
         if now >= deadline {
-            return Err(Error::Timeout);
+            return Err(Error::timeout());
         }
         timeout = timeout.min(deadline.saturating_duration_since(now));
     }
@@ -927,31 +934,37 @@ pub struct Query<'a> {
 }
 
 impl<'a> Query<'a> {
+    /// Append one `?` binding.
     pub fn bind(mut self, bind: Bind) -> Self {
         self.binds.push(bind);
         self
     }
 
+    /// Append bindings, in `?` order.
     pub fn binds(mut self, binds: impl IntoIterator<Item = Bind>) -> Self {
         self.binds.extend(binds);
         self
     }
 
+    /// Ask Snowflake to describe the statement without executing it.
     pub fn describe_only(mut self, describe_only: bool) -> Self {
         self.describe_only = describe_only;
         self
     }
 
+    /// Return as soon as Snowflake accepts the statement. The result may be pending.
     pub fn async_exec(mut self, async_exec: bool) -> Self {
         self.async_exec = async_exec;
         self
     }
 
+    /// Set one query parameter. `GO_QUERY_RESULT_FORMAT` selects Arrow or JSON.
     pub fn parameter(mut self, key: impl Into<String>, value: impl Into<String>) -> Self {
         self.parameters.insert(key.into(), value.into());
         self
     }
 
+    /// Run the statement and return its result.
     pub async fn execute(self) -> Result<QueryResult> {
         self.session
             .execute(QueryParts {
@@ -968,10 +981,15 @@ impl<'a> Query<'a> {
 /// Status reported by the monitoring endpoint.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum QueryStatus {
+    /// Still queued or running.
     Running,
+    /// Finished successfully.
     Success,
+    /// Finished with an error.
     Failed,
+    /// Cancelled or disconnected.
     Aborted,
+    /// A status string this driver does not classify.
     Other(String),
 }
 

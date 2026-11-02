@@ -67,7 +67,7 @@ snowflake-rs/                      # Cargo workspace
 | Arrow | `arrow-array`, `arrow-schema`, `arrow-ipc`, `arrow-buffer` | **版本与 `adbc_core` 依赖的 arrow 大版本对齐**（arrow-rs 每月出大版本，必须锁定） |
 | ADBC | `adbc_core`, `adbc_ffi`（导出）, `adbc_driver_manager`（仅测试） | Apache Arrow ADBC 官方 Rust crate |
 | JWT / 密钥 | `rsa`, `pkcs8`, `sha2`, `base64`, `jsonwebtoken`（或手工拼 RS256） | 支持 PKCS#8 PEM，含 PBES2 加密私钥 |
-| 其他 | `uuid`（requestId）, `thiserror`, `tracing`, `bytes`, `futures` | |
+| 其他 | `uuid`（requestId）, `tracing`, `bytes`, `futures` | 本仓库的 `Error` 不再使用 `thiserror` |
 
 不引入数据库连接池、不引入 ORM，保持驱动定位。
 

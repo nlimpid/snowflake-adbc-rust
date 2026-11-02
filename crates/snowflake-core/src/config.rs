@@ -8,12 +8,17 @@ use url::Url;
 use crate::auth::Authenticator;
 use crate::error::{Error, Result};
 
+/// Default `CLIENT_ENVIRONMENT.APPLICATION` value.
 pub const DEFAULT_APP_NAME: &str = "snowflake-rs";
+/// This crate's version, sent in the user agent. Not the Go compatibility pin.
 pub const DRIVER_VERSION: &str = env!("CARGO_PKG_VERSION");
 /// `CLIENT_APP_ID` / version sent so Snowflake honors `GO_QUERY_RESULT_FORMAT`.
 pub const GOSNOWFLAKE_APP_ID: &str = "Go";
+/// Fixed `CLIENT_APP_VERSION` sent so Snowflake honors `GO_QUERY_RESULT_FORMAT`.
 pub const GOSNOWFLAKE_COMPAT_VERSION: &str = "1.13.3";
+/// Default number of result chunks downloaded at once.
 pub const DEFAULT_PREFETCH: usize = 4;
+/// Default budget for HTTP retries.
 pub const DEFAULT_RETRY_TIMEOUT: Duration = Duration::from_secs(300);
 
 /// Host Snowflake would use for `account` when `host` is not overridden.
@@ -31,24 +36,43 @@ pub fn default_host(account: &str) -> String {
 }
 
 #[derive(Clone)]
+/// Resolved client settings. Build one with [`ClientBuilder`].
 pub struct ClientConfig {
+    /// Account identifier.
     pub account: String,
+    /// Login name.
     pub user: String,
+    /// How to obtain a session.
     pub authenticator: Authenticator,
+    /// Warehouse.
     pub warehouse: Option<String>,
+    /// Database.
     pub database: Option<String>,
+    /// Schema.
     pub schema: Option<String>,
+    /// Role.
     pub role: Option<String>,
+    /// Host override.
     pub host: Option<String>,
+    /// Port override.
     pub port: Option<u16>,
+    /// URL scheme, `https` by default.
     pub protocol: String,
+    /// Value sent as `CLIENT_ENVIRONMENT.APPLICATION`.
     pub app_name: String,
+    /// How many result chunks to download at once.
     pub prefetch_concurrency: usize,
+    /// Deadline for one statement, including polls.
     pub query_timeout: Option<Duration>,
+    /// Deadline for one login HTTP attempt.
     pub login_timeout: Option<Duration>,
+    /// Budget for HTTP retries.
     pub retry_timeout: Duration,
+    /// Deadline for one HTTP attempt.
     pub http_attempt_timeout: Duration,
+    /// Session parameters sent at login.
     pub session_parameters: HashMap<String, String>,
+    /// Whether to send session heartbeats.
     pub keep_alive: bool,
 }
 
@@ -72,6 +96,7 @@ impl std::fmt::Debug for ClientConfig {
 }
 
 impl ClientConfig {
+    /// Account URL, including an explicit host and port when set.
     pub fn base_url(&self) -> Result<Url> {
         let host = match &self.host {
             Some(host) => host.trim().to_string(),
@@ -87,6 +112,7 @@ impl ClientConfig {
         Url::parse(&raw).map_err(|err| Error::protocol(format!("invalid base url {raw}: {err}")))
     }
 
+    /// User-Agent header: app name, crate version, and OS.
     pub fn user_agent(&self) -> String {
         format!(
             "{}/{} (rust; {})",
@@ -98,6 +124,7 @@ impl ClientConfig {
 }
 
 #[derive(Clone)]
+/// Builds a [`crate::SnowflakeClient`]. `account`, `user`, and `authenticator` are required.
 pub struct ClientBuilder {
     account: Option<String>,
     user: Option<String>,
@@ -145,95 +172,114 @@ impl Default for ClientBuilder {
 }
 
 impl ClientBuilder {
+    /// Empty builder. Protocol is `https`, login timeout is 60s, retry budget is 300s.
     pub fn new() -> Self {
         Self::default()
     }
 
+    /// Set the account identifier. Underscores become hyphens in the default host.
     pub fn account(mut self, account: impl Into<String>) -> Self {
         self.account = Some(account.into());
         self
     }
 
+    /// Set the login name.
     pub fn user(mut self, user: impl Into<String>) -> Self {
         self.user = Some(user.into());
         self
     }
 
+    /// Set how the client logs in.
     pub fn authenticator(mut self, authenticator: Authenticator) -> Self {
         self.authenticator = Some(authenticator);
         self
     }
 
+    /// Set the warehouse sent on login and on relogin.
     pub fn warehouse(mut self, warehouse: impl Into<String>) -> Self {
         self.warehouse = Some(warehouse.into());
         self
     }
 
+    /// Set the database sent on login and on relogin.
     pub fn database(mut self, database: impl Into<String>) -> Self {
         self.database = Some(database.into());
         self
     }
 
+    /// Set the schema sent on login and on relogin.
     pub fn schema(mut self, schema: impl Into<String>) -> Self {
         self.schema = Some(schema.into());
         self
     }
 
+    /// Set the role sent on login and on relogin.
     pub fn role(mut self, role: impl Into<String>) -> Self {
         self.role = Some(role.into());
         self
     }
 
+    /// Override the host. Use this for PrivateLink.
     pub fn host(mut self, host: impl Into<String>) -> Self {
         self.host = Some(host.into());
         self
     }
 
+    /// Override the port. The default is 443.
     pub fn port(mut self, port: u16) -> Self {
         self.port = Some(port);
         self
     }
 
+    /// Set the URL scheme. The default is `https`.
     pub fn protocol(mut self, protocol: impl Into<String>) -> Self {
         self.protocol = protocol.into();
         self
     }
 
+    /// Set `CLIENT_ENVIRONMENT.APPLICATION`. This is not `CLIENT_APP_ID`.
     pub fn app_name(mut self, app_name: impl Into<String>) -> Self {
         self.app_name = app_name.into();
         self
     }
 
+    /// Set how many result chunks to download at once. Values below 1 become 1.
     pub fn prefetch_concurrency(mut self, threads: usize) -> Self {
         self.prefetch_concurrency = threads.max(1);
         self
     }
 
+    /// Set the deadline for one statement, including polls. Unset means no statement deadline.
     pub fn query_timeout(mut self, timeout: Duration) -> Self {
         self.query_timeout = Some(timeout);
         self
     }
 
+    /// Set the deadline for one login HTTP attempt.
     pub fn login_timeout(mut self, timeout: Duration) -> Self {
         self.login_timeout = Some(timeout);
         self
     }
 
+    /// Set the budget for HTTP retries.
     pub fn retry_timeout(mut self, timeout: Duration) -> Self {
         self.retry_timeout = timeout;
         self
     }
 
+    /// Set one `SESSION_PARAMETERS` entry sent at login.
     pub fn session_parameter(mut self, key: impl Into<String>, value: impl Into<String>) -> Self {
         self.session_parameters.insert(key.into(), value.into());
         self
     }
 
+    /// Send session heartbeats. A `CLIENT_SESSION_KEEP_ALIVE` parameter also enables them.
     pub fn keep_alive(mut self, enabled: bool) -> Self {
         self.keep_alive = enabled;
         self
     }
 
+    /// Validate the account, user, authenticator, and base URL, then build the client.
     pub fn build(self) -> Result<crate::client::SnowflakeClient> {
         let account = self
             .account

@@ -126,11 +126,11 @@ fn normalize_column(
 }
 
 fn annotate(err: Error, column: &RowType) -> Error {
-    match err {
-        Error::Protocol(reason) => {
-            Error::decode(&column.name, 0, column.logical_type(), None, reason)
+    match err.kind() {
+        snowflake_core::ErrorKind::Protocol => {
+            Error::decode(&column.name, 0, column.logical_type(), None, err.message())
         }
-        other => other,
+        _ => err,
     }
 }
 

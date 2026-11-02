@@ -77,15 +77,18 @@ impl NameValue {
 }
 
 #[derive(Debug, Clone, Default)]
+/// Session parameters carried on login and query responses.
 pub struct SessionParameters {
     map: HashMap<String, String>,
 }
 
 impl SessionParameters {
+    /// Set one parameter.
     pub fn insert(&mut self, name: impl Into<String>, value: impl Into<String>) {
         self.map.insert(name.into(), value.into());
     }
 
+    /// Apply `parameters[]` from a response. Entries without a value are skipped.
     pub fn extend_from_response(&mut self, parameters: &[NameValue]) {
         for parameter in parameters {
             if let Some(value) = parameter.value_string() {
@@ -94,14 +97,17 @@ impl SessionParameters {
         }
     }
 
+    /// Look up a parameter by its Snowflake name.
     pub fn get(&self, key: &str) -> Option<&str> {
         self.map.get(key).map(String::as_str)
     }
 
+    /// `TIMEZONE`, or `UTC` when the session has not reported one.
     pub fn timezone(&self) -> &str {
         self.get("TIMEZONE").unwrap_or("UTC")
     }
 
+    /// True when the parameter is `true` or `1`, ignoring ASCII case.
     pub fn flag(&self, key: &str) -> bool {
         matches!(
             self.get(key)
@@ -110,6 +116,7 @@ impl SessionParameters {
         )
     }
 
+    /// Parameter names and values as returned by Snowflake.
     pub fn as_map(&self) -> &HashMap<String, String> {
         &self.map
     }
@@ -119,24 +126,34 @@ impl SessionParameters {
 #[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct RowType {
+    /// Column name.
     pub name: String,
     #[serde(default)]
+    /// Database that owns the column.
     pub database: String,
     #[serde(default)]
+    /// Schema that owns the column.
     pub schema: String,
     #[serde(default)]
+    /// Table that owns the column.
     pub table: String,
     #[serde(rename = "type", default)]
+    /// Snowflake logical type, such as `fixed` or `timestamp_tz`.
     pub logical_type: String,
     #[serde(default)]
+    /// Whether the column accepts NULL.
     pub nullable: bool,
     #[serde(default)]
+    /// Declared precision, when the type has one.
     pub precision: Option<i64>,
     #[serde(default)]
+    /// Declared scale, when the type has one.
     pub scale: Option<i64>,
     #[serde(default)]
+    /// Declared length, when the type has one.
     pub length: Option<i64>,
     #[serde(default)]
+    /// Declared byte length, when the type has one.
     pub byte_length: Option<i64>,
     /// Nested fields. `VECTOR` uses `fields[0].type` (`fixed` or `real`).
     #[serde(default)]
@@ -144,14 +161,17 @@ pub struct RowType {
 }
 
 impl RowType {
+    /// Snowflake logical type.
     pub fn logical_type(&self) -> &str {
         &self.logical_type
     }
 
+    /// Declared precision, or `default` when Snowflake omitted it.
     pub fn precision_or(&self, default: i64) -> i64 {
         self.precision.unwrap_or(default)
     }
 
+    /// Declared scale, or `default` when Snowflake omitted it.
     pub fn scale_or(&self, default: i64) -> i64 {
         self.scale.unwrap_or(default)
     }

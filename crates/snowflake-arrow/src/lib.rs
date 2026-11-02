@@ -1,8 +1,8 @@
 //! Strict Arrow conversion for Snowflake results.
 //!
 //! JSON rowsets and Arrow IPC chunks for the same `rowtype` produce the same
-//! schema. A cell that does not match the declared type is [`Error::Decode`](snowflake_core::Error::Decode),
-//! not a NULL.
+//! schema. A cell that does not match the declared type is
+//! [`ErrorKind::Decode`](snowflake_core::ErrorKind::Decode), not a NULL.
 
 mod json;
 mod normalize;

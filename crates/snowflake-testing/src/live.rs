@@ -1,5 +1,5 @@
 use futures::StreamExt;
-use snowflake_core::{Authenticator, Error, SnowflakeClient};
+use snowflake_core::{Authenticator, SnowflakeClient};
 
 use crate::{exec_both_formats, test_config, test_session};
 
@@ -39,15 +39,13 @@ async fn live_wrong_password() {
         .build()
         .unwrap();
     let err = client.connect().await.unwrap_err();
-    match err {
-        Error::Auth { code, message } => {
-            assert!(
-                code == "390100" || code == "390102" || code == "390127",
-                "{code}: {message}"
-            );
-        }
-        other => panic!("expected authentication failure, got {other}"),
-    }
+    assert_eq!(err.kind(), snowflake_core::ErrorKind::Auth, "{err}");
+    let code = err.code().unwrap_or_default();
+    assert!(
+        code == "390100" || code == "390102" || code == "390127",
+        "{code}: {}",
+        err.message()
+    );
 }
 
 #[tokio::test]
