@@ -1,6 +1,5 @@
 //! HTTP calls against the Snowflake SQL API, with the driver's retry rules.
 
-use std::error::Error as StdError;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use reqwest::Method;
@@ -54,12 +53,13 @@ pub async fn send_json(
         let timeout = request.attempt_timeout.min(remaining);
         match send_once(client, base, &request, &request_id, attempt, timeout).await {
             Ok(envelope) => return Ok(envelope),
-            Err(err) if err_is_retryable(&err) && started.elapsed() < request.retry_budget => {
+            Err(err) if err.is_temporary() && started.elapsed() < request.retry_budget => {
                 tracing::debug!(attempt, %err, "retrying snowflake request");
                 tokio::time::sleep(delay.min(remaining)).await;
                 delay = (delay * 2).min(Duration::from_secs(16));
                 attempt = attempt.saturating_add(1);
             }
+            Err(err) if err.is_temporary() => return Err(err.set_persistent()),
             Err(err) => return Err(err),
         }
     }
@@ -99,20 +99,6 @@ async fn send_once(
         return Err(Error::http_status(status.as_u16(), truncate(&bytes)));
     }
     Envelope::parse(&bytes)
-}
-
-fn err_is_retryable(err: &Error) -> bool {
-    match err.kind() {
-        crate::error::ErrorKind::Http => err
-            .source()
-            .and_then(|source| source.downcast_ref::<reqwest::Error>())
-            .is_some_and(|http| http.is_timeout() || http.is_connect() || http.is_request()),
-        crate::error::ErrorKind::HttpStatus => err
-            .status()
-            .is_some_and(|status| status == 429 || status == 408 || status >= 500),
-        crate::error::ErrorKind::Timeout => true,
-        _ => false,
-    }
 }
 
 fn build_url(

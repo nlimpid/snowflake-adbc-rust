@@ -21,6 +21,7 @@ categories = ["database", "api-bindings"]
 
 [workspace.dependencies]
 adbc_core = "0.24"
+anyhow = "1"
 async-stream = "0.3"
 adbc_driver_manager = "0.24"
 adbc_ffi = "0.24"
