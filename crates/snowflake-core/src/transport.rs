@@ -154,16 +154,16 @@ pub async fn download_bytes(
     for attempt in 0..3 {
         match download_once(client, url, headers, user_agent).await {
             Ok(bytes) => return Ok(bytes),
-            Err(err) => {
+            Err(err) if err.is_temporary() && attempt < 2 => {
                 last = err;
-                if attempt < 2 {
-                    tokio::time::sleep(delay).await;
-                    delay = (delay * 2).min(Duration::from_secs(8));
-                }
+                tokio::time::sleep(delay).await;
+                delay = (delay * 2).min(Duration::from_secs(8));
             }
+            Err(err) if err.is_temporary() => return Err(err.set_persistent()),
+            Err(err) => return Err(err),
         }
     }
-    Err(last)
+    Err(last.set_persistent())
 }
 
 async fn download_once(
